@@ -34,7 +34,8 @@ class GlueVAEDataset(Dataset):
         lmdb_path: Optional[str] = None,
         max_atoms: int = 1000,
         patch_radius: float = 15.0,
-        max_num_neighbors: int = 32
+        max_num_neighbors: int = 32,
+        num_fps_points: int = 5
     ):
         """
         参数:
@@ -44,14 +45,19 @@ class GlueVAEDataset(Dataset):
             max_atoms: 触发补丁采样的最大原子数，默认1000。
             patch_radius: 补丁采样的半径阈值，单位Å，默认15.0。
             max_num_neighbors: 每个节点的最大邻居数，防止边数爆炸，默认32。
+            num_fps_points: 使用最远点采样(FPS)生成的候选中心数量，默认5。
         """
         self.lmdb_path = lmdb_path or os.path.join(root, "processed_lmdb")
         self.split = split
         self.max_atoms = max_atoms
         self.patch_radius = patch_radius
         self.max_num_neighbors = max_num_neighbors
+        self.num_fps_points = num_fps_points
         self._keys: Optional[List[bytes]] = None
         self._env: Optional[lmdb.Environment] = None
+        
+        # 用于维护每个样本的采样状态
+        self._sample_states = {}
         
         # 几何计算工具：高斯径向基函数 (RBF)
         self.rbf = GaussianRBF(n_rbf=16, cutoff=4.5, start=0.0)
@@ -95,20 +101,116 @@ class GlueVAEDataset(Dataset):
         self._load_keys()
         return len(self._keys)
     
+    def _farthest_point_sampling(
+        self,
+        points: torch.Tensor,
+        num_points: int
+    ) -> torch.Tensor:
+        """
+        最远点采样(FPS)：从点集中选择最远的num_points个点。
+        
+        参数:
+            points: 点坐标 [N, 3]
+            num_points: 要选择的点数
+        
+        返回:
+            selected_indices: 选中点的索引 [num_points]
+        """
+        N = points.size(0)
+        if N <= num_points:
+            return torch.arange(N, device=points.device)
+        
+        selected_indices = []
+        # 随机选择第一个点
+        idx = torch.randint(0, N, (1,), device=points.device).item()
+        selected_indices.append(idx)
+        
+        # 计算所有点到已选点的最小距离
+        dists = torch.norm(points - points[idx:idx+1], dim=1)
+        
+        for _ in range(1, num_points):
+            # 选择距离最远的点
+            idx = torch.argmax(dists).item()
+            selected_indices.append(idx)
+            
+            # 更新最小距离
+            new_dists = torch.norm(points - points[idx:idx+1], dim=1)
+            dists = torch.min(dists, new_dists)
+        
+        return torch.tensor(selected_indices, device=points.device)
+    
+    def _get_or_create_sample_state(
+        self,
+        key: bytes,
+        pos: torch.Tensor,
+        mask_interface: torch.Tensor
+    ) -> Tuple[List[int], int]:
+        """
+        获取或创建样本的采样状态。
+        
+        参数:
+            key: 数据键
+            pos: 原子坐标 [N, 3]
+            mask_interface: 界面掩码 [N]
+        
+        返回:
+            (candidate_centers, current_index): 候选中心列表和当前索引
+        """
+        key_str = key.decode('utf-8')
+        
+        if key_str not in self._sample_states:
+            # 第一次访问该样本，生成FPS候选中心
+            interface_indices = torch.where(mask_interface == 1)[0]
+            
+            if len(interface_indices) < self.num_fps_points:
+                # 界面原子不够，使用所有界面原子
+                candidate_indices = interface_indices
+            else:
+                # 对界面原子进行FPS
+                interface_pos = pos[interface_indices]
+                fps_indices_in_interface = self._farthest_point_sampling(
+                    interface_pos,
+                    self.num_fps_points
+                )
+                candidate_indices = interface_indices[fps_indices_in_interface]
+            
+            self._sample_states[key_str] = {
+                'candidate_centers': candidate_indices.tolist(),
+                'current_index': 0
+            }
+        
+        state = self._sample_states[key_str]
+        return state['candidate_centers'], state['current_index']
+    
+    def _update_sample_state(self, key: bytes):
+        """
+        更新样本的采样状态，移动到下一个候选中心。
+        
+        参数:
+            key: 数据键
+        """
+        key_str = key.decode('utf-8')
+        if key_str in self._sample_states:
+            state = self._sample_states[key_str]
+            state['current_index'] = (state['current_index'] + 1) % len(state['candidate_centers'])
+    
     def _dynamic_patch_sampling(
         self,
+        key: bytes,
         pos: torch.Tensor,
         z: torch.Tensor,
         residue_index: torch.Tensor,
         is_ligand: torch.Tensor,
         mask_interface: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool, int]:
         """
         动态补丁采样：如果原子数超过 max_atoms，则采样以界面为中心的局部补丁。
         
-        策略：先采样 Patch，再旋转 Patch，这样计算量更小。
+        策略：使用最远点采样(FPS)系统性地覆盖整个界面。
+              先采样 Patch，再旋转 Patch，这样计算量更小。
         
         参数:
+            key: 数据键，用于维护采样状态
             pos: 原子坐标 [N, 3]
             z: 原子序数 [N]
             residue_index: 残基索引 [N]
@@ -116,25 +218,27 @@ class GlueVAEDataset(Dataset):
             mask_interface: 界面标记 [N]
         
         返回:
-            (pos, z, residue_index, is_ligand, mask_interface, is_patched)
+            (pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index)
         """
         N = pos.size(0)
         is_patched = False
+        patch_index = 0
         
         if N <= self.max_atoms:
-            return pos, z, residue_index, is_ligand, mask_interface, is_patched
+            return pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index
         
         is_patched = True
         
-        # 在界面核心原子中随机选择一个中心
-        interface_indices = torch.where(mask_interface == 1)[0]
+        # 获取或创建该样本的FPS候选中心
+        candidate_centers, current_index = self._get_or_create_sample_state(
+            key, pos, mask_interface
+        )
         
-        if len(interface_indices) == 0:
-            # 如果没有界面原子，随机选择一个中心
-            center_idx = torch.randint(0, N, (1,)).item()
-        else:
-            # 随机选择一个界面原子作为中心
-            center_idx = interface_indices[torch.randint(0, len(interface_indices), (1,))].item()
+        patch_index = current_index
+        center_idx = candidate_centers[current_index]
+        
+        # 更新采样状态，下次使用下一个中心
+        self._update_sample_state(key)
         
         # 计算所有原子到中心的距离
         center_pos = pos[center_idx:center_idx+1]  # [1, 3]
@@ -155,7 +259,7 @@ class GlueVAEDataset(Dataset):
         is_ligand = is_ligand[keep_mask]
         mask_interface = mask_interface[keep_mask]
         
-        return pos, z, residue_index, is_ligand, mask_interface, is_patched
+        return pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index
     
     def _build_optimized_graph(
         self,
@@ -315,10 +419,11 @@ class GlueVAEDataset(Dataset):
         
         # 4. Dynamic Patch Sampling（在数据增强之前）
         is_patched = False
+        patch_index = 0
         original_num_nodes = pos.size(0)
         
-        pos, z, residue_index, is_ligand, mask_interface, is_patched = self._dynamic_patch_sampling(
-            pos, z, residue_index, is_ligand, mask_interface
+        pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index = self._dynamic_patch_sampling(
+            key, pos, z, residue_index, is_ligand, mask_interface
         )
         
         # 5. 数据增强 (随机旋转) - 在Patch Sampling之后
@@ -371,6 +476,7 @@ class GlueVAEDataset(Dataset):
         data.pdb_id = meta['pdb_id']
         data.chains = meta['chains']
         data.is_patched = is_patched
+        data.patch_index = patch_index
         data.original_num_nodes = original_num_nodes
         
         return data
