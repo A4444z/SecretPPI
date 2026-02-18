@@ -157,7 +157,7 @@ class ConditionalPaiNNDecoder(nn.Module):
         
     def forward(
         self,
-        z,
+        atom_latent,
         z_atom,
         vector_features,
         edge_index,
@@ -167,7 +167,7 @@ class ConditionalPaiNNDecoder(nn.Module):
     ):
         """
         参数:
-            z: [R, latent_dim] 残基级潜在向量
+            atom_latent: [N, hidden_dim] 原子级潜在特征
             z_atom: [N] 原子序数
             vector_features: [N, 3] 向量特征
             edge_index: [2, E] 边索引
@@ -177,8 +177,11 @@ class ConditionalPaiNNDecoder(nn.Module):
         返回:
             [N, 3] 预测的坐标偏移/更新
         """
+        # 初始化标量特征：嵌入 + 潜在特征
+        s_initial = self.painn.embedding(z_atom) + atom_latent
+        
         # 通过 PaiNN 提取特征
-        s, v = self.painn(z_atom, vector_features, edge_index, edge_attr, pos)
+        s, v = self.painn(z_atom, vector_features, edge_index, edge_attr, pos, initial_s=s_initial)
         
         # 预测坐标偏移
         delta_pos = self.coord_decoder(s)
@@ -285,10 +288,12 @@ class GlueVAE(nn.Module):
         # 潜在 -&gt; 残基特征
         res_features = self.latent_decoder(z_latent)
         
-        # 残基 -&gt; 原子（用于条件，但这里我们直接用 PaiNN 处理）
+        # Unpooling：残基特征 -&gt; 原子特征
+        atom_latent = self.residue_unpooling(res_features, residue_index)
+        
         # 通过解码器
         delta_pos = self.decoder(
-            z_latent, z_atom, vector_features,
+            atom_latent, z_atom, vector_features,
             edge_index, edge_attr, pos, residue_index
         )
         

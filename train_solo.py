@@ -100,9 +100,9 @@ def train_epoch(
         loss, recon_loss, kl_loss = criterion(
             pos_pred=pos_pred,
             pos_true=batch.pos,
-            mu=mu.mean(dim=0) if mu.dim() > 1 else mu,
-            logvar=logvar.mean(dim=0) if logvar.dim() > 1 else logvar,
-            mask=batch.mask_interface
+            mu=mu,
+            logvar=logvar,
+            mask=batch.mask_interface, batch_idx=batch.batch
         )
         
         # 反向传播
@@ -183,9 +183,9 @@ def validate(
         loss, recon_loss, kl_loss = criterion(
             pos_pred=pos_pred,
             pos_true=batch.pos,
-            mu=mu.mean(dim=0) if mu.dim() > 1 else mu,
-            logvar=logvar.mean(dim=0) if logvar.dim() > 1 else logvar,
-            mask=batch.mask_interface
+            mu=mu,
+            logvar=logvar,
+            mask=batch.mask_interface, batch_idx=batch.batch
         )
         
         total_loss += loss.item()

@@ -1,4 +1,5 @@
 
+
 """
 损失函数模块。
 实现 D-RMSD (Distance-RMSD) 损失和 KL 散度，用于 VAE 训练。
@@ -7,29 +8,13 @@
 - D-RMSD：基于成对距离矩阵，保证 SE(3) 不变性，无需对齐
 - KL 散度：β-VAE 正则化
 - β 退火策略
+- 支持 PyG 批量图处理
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-
-def compute_pairwise_distances(pos):
-    """
-    计算原子坐标的成对距离矩阵。
-    
-    参数:
-        pos: [N, 3] 原子坐标张量
-    返回:
-        [N, N] 成对距离矩阵
-    """
-    # 向量化计算: (a - b)^2 = a^2 + b^2 - 2ab
-    pos_sq = torch.sum(pos ** 2, dim=-1, keepdim=True)  # [N, 1]
-    dist_sq = pos_sq + pos_sq.transpose(-1, -2) - 2.0 * torch.matmul(pos, pos.transpose(-1, -2))
-    dist_sq = torch.clamp(dist_sq, min=0.0)  # 防止数值误差导致负数
-    dist = torch.sqrt(dist_sq)
-    return dist
+from torch_geometric.utils import to_dense_batch
 
 
 class DRMSDLoss(nn.Module):
@@ -40,6 +25,7 @@ class DRMSDLoss(nn.Module):
     优势：
     - SE(3) 不变：旋转/平移输入不影响损失值
     - 无需对齐：不需要 Kabsch 算法
+    - 支持批量图处理
     """
     
     def __init__(self, reduction='mean'):
@@ -50,40 +36,46 @@ class DRMSDLoss(nn.Module):
         self,
         pos_pred,
         pos_true,
-        mask=None
+        mask=None,
+        batch_idx=None
     ):
         """
         参数:
             pos_pred: [N, 3] 预测的原子坐标
             pos_true: [N, 3] 真实的原子坐标
             mask: [N] 可选的原子掩码，1表示有效
+            batch_idx: [N] PyG 批量索引，区分不同图
         返回:
             D-RMSD 损失标量
         """
-        # 计算成对距离矩阵
-        D_pred = compute_pairwise_distances(pos_pred)  # [N, N]
-        D_true = compute_pairwise_distances(pos_true)  # [N, N]
+        if batch_idx is None:
+            batch_idx = torch.zeros(pos_pred.size(0), dtype=torch.long, device=pos_pred.device)
         
-        # 计算 MSE
+        # 转为密集矩阵 [B, N_max, 3]
+        pos_pred_dense, batch_mask = to_dense_batch(pos_pred, batch_idx)
+        pos_true_dense, _ = to_dense_batch(pos_true, batch_idx)
+        
+        # 计算安全的成对距离 [B, N_max, N_max]
+        D_pred = torch.cdist(pos_pred_dense, pos_pred_dense, p=2.0)
+        D_true = torch.cdist(pos_true_dense, pos_true_dense, p=2.0)
+        
         mse = (D_pred - D_true) ** 2
         
-        # 应用掩码
-        if mask is not None:
-            mask_2d = mask.unsqueeze(0) * mask.unsqueeze(1)  # [N, N]
-            mse = mse * mask_2d
-            total_weight = mask_2d.sum()
-        else:
-            total_weight = mse.numel()
+        # 有效节点掩码 (去除 padding 的虚拟节点)
+        valid_2d = batch_mask.unsqueeze(1) * batch_mask.unsqueeze(2)
         
-        # Reduction
-        if self.reduction == 'mean':
-            loss = mse.sum() / (total_weight + 1e-8)
-        elif self.reduction == 'sum':
-            loss = mse.sum()
+        if mask is not None:
+            mask_dense, _ = to_dense_batch(mask, batch_idx)
+            mask_2d = mask_dense.unsqueeze(1) * mask_dense.unsqueeze(2)
+            final_mask = mask_2d * valid_2d
         else:
-            loss = mse
-            
-        return loss
+            final_mask = valid_2d
+        
+        mse = mse * final_mask
+        
+        if self.reduction == 'mean':
+            return mse.sum() / (final_mask.sum() + 1e-8)
+        return mse.sum()
 
 
 class KLLoss(nn.Module):
@@ -151,7 +143,7 @@ class BetaScheduler:
         self.step += 1
         return self.get_beta()
         
-    def get_beta(self) -> float:
+    def get_beta(self):
         """获取当前的 β 值，不更新步数。"""
         if self.schedule_type == 'linear':
             if self.step < self.warmup_steps:
@@ -210,19 +202,21 @@ class VAELoss(nn.Module):
         pos_true,
         mu,
         logvar,
-        mask=None
+        mask=None,
+        batch_idx=None
     ):
         """
         参数:
             pos_pred: [N, 3] 预测坐标
             pos_true: [N, 3] 真实坐标
-            mu: [latent_dim] 潜在空间均值
-            logvar: [latent_dim] 潜在空间对数方差
+            mu: [latent_dim] 或 [N, latent_dim] 潜在空间均值
+            logvar: [latent_dim] 或 [N, latent_dim] 潜在空间对数方差
             mask: [N] 可选的原子掩码
+            batch_idx: [N] PyG 批量索引
         返回:
             (total_loss, recon_loss, kl_loss)
         """
-        recon_loss = self.drmsd_loss(pos_pred, pos_true, mask)
+        recon_loss = self.drmsd_loss(pos_pred, pos_true, mask, batch_idx)
         kl_loss = self.kl_loss(mu, logvar)
         total_loss = recon_loss + self.beta * kl_loss
         
