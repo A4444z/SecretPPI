@@ -245,6 +245,7 @@ def main():
     parser.add_argument('--config', type=str, default='config_solo.yaml', help='Path to config file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--overfit_test', action='store_true', help='Enable overfit test mode')
     args = parser.parse_args()
     
     # 设置随机种子
@@ -293,6 +294,17 @@ def main():
     print(f"Total dataset size: {total_len}")
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size: {len(val_dataset)}")
+    
+    if args.overfit_test:
+        print("!!! RUNNING IN OVERFIT TEST MODE !!!")
+        # 强制只取前 batch_size 个样本
+        subset_indices = list(range(config['data']['batch_size']))
+        from torch.utils.data import Subset
+        tiny_subset = Subset(full_dataset, subset_indices)
+        # 让训练集和验证集完全一样，测试死记硬背能力
+        train_dataset = tiny_subset
+        val_dataset = tiny_subset
+        print(f"Overfit test: Using {len(train_dataset)} samples for both train and val")
     
     # 创建 DataLoader
     train_loader = PyGDataLoader(
@@ -374,7 +386,7 @@ def main():
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
+        start_epoch = checkpoint['epoch'] + 1
         global_step = checkpoint['step']
         print(f"Resumed at epoch {start_epoch}, step {global_step}")
     

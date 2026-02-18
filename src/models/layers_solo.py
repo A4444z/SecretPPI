@@ -340,8 +340,8 @@ class PaiNNEncoder(nn.Module):
         
         # 初始化向量特征: [N, 3] -&gt; [N, hidden_dim, 3]
         v = self.v_init_proj(vector_features.unsqueeze(1)).transpose(1, 2)
-        # 或者更简单的方式：广播
-        v = vector_features.unsqueeze(1).repeat(1, self.hidden_dim, 1)  # [N, hidden_dim, 3]
+        # 或者更简单的方式：广播（经Gemini和codex提醒不使用该方法）
+        # v = vector_features.unsqueeze(1).repeat(1, self.hidden_dim, 1)  # [N, hidden_dim, 3]
         
         # 计算边向量: r_j - r_i
         row, col = edge_index

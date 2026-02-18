@@ -1,0 +1,80 @@
+
+
+# GlueVAE 配置文件 - 过拟合测试 (Overfit Sanity Check)
+# 用于测试模型能否完美记忆小数据集（证明模型有学习能力）
+
+# 数据配置
+data:
+  root_dir: "./"
+  lmdb_path: "data/processed_lmdb"
+  exclude_pdb_json: "database/CASF-2016_pdb_ids.json"
+  train_split: 0.9
+  val_split: 0.05
+  test_split: 0.05
+  batch_size: 4  # 过拟合测试时保持小批量
+  num_workers: 4
+  pin_memory: true
+
+# 模型配置
+model:
+  hidden_dim: 128
+  latent_dim: 32
+  num_encoder_layers: 6
+  num_decoder_layers: 4
+  edge_dim: 19
+  vocab_size: 101
+  use_gradient_checkpointing: true
+
+# 训练配置
+training:
+  num_epochs: 500  # 大量 epochs 用于过拟合
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  max_grad_norm: 10.0
+  
+  # KL 散度退火配置 - 全部设为0，纯测试D-RMSD重构能力
+  beta:
+    start: 0.0
+    end: 0.0  # 关闭KL约束
+    warmup_steps: 10000
+    schedule_type: "linear"
+  
+  # 优化器配置
+  optimizer:
+    type: "Adam"
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  
+  # 学习率调度器
+  scheduler:
+    type: "ReduceLROnPlateau"
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+# 日志和保存配置
+logging:
+  project: "GlueVAE_Overfit_Test"
+  entity: null
+  log_interval: 10
+  val_interval: 10  # 每10个epoch验证
+  save_interval: 100  # 每100个epoch保存
+  save_dir: "checkpoints_overfit"
+  use_wandb: false
+
+# 几何配置
+geometry:
+  cutoff: 4.5
+  rbf_dim: 16
+  contact_cutoff: 4.0
+
+# SE(3) 数据增强 - 过拟合测试时关闭增强，方便死记硬背
+augmentation:
+  train:
+    random_rotation: false  # 关闭旋转增强
+    random_translation: false
+    translation_std: 0.1
+  val:
+    random_rotation: false
+    random_translation: false
+
