@@ -1,5 +1,30 @@
 # GlueVAE：蛋白质-蛋白质相互作用生成模型
 
+## 📢 最近更新 (2026-02-18)
+
+### 1. CASF-2016 验证集支持
+- **新增** `collect_casf_pdb_ids.py`: 收集CASF-2016数据集中的所有PDB ID
+- **新增** `database/CASF-2016_pdb_ids.json`: 包含285个需排除的PDB ID
+- **新增** `database/CASF-2016_USAGE_GUIDE.md`: CASF-2016使用说明
+- **功能**: 在数据加载时自动过滤验证集PDB ID，确保训练集和验证集分离
+
+### 2. 原子级VAE架构
+- **改进**: 实现原子级VAE架构，保持每个原子的独特特征
+- **解决**: 之前同一残基的所有原子特征完全相同的问题
+- **新增**: `AtomLevelLatentEncoder` 和 `AtomLevelLatentDecoder`
+
+### 3. 数据集加载优化
+- **Dynamic Patch Sampling**: 对大界面进行随机补丁采样，避免显存溢出
+- **Farthest Point Sampling (FPS)**: 系统性覆盖界面区域，确保全面性
+- **CASF-2016过滤**: 在 `src/data/dataset.py` 中添加 `exclude_pdb_json` 参数
+
+### 4. 工具脚本
+- **新增** `scripts/build_lmdb_resumable.py`: 支持断点续传的LMDB数据集构建
+- **新增** `test_casf_filter.py`: 测试CASF-2016过滤功能
+- **新增** 多个配置文件: `config_solo.yaml`, `config_solo_test.yaml`, `config_solo_partial.yaml`
+
+---
+
 ## 目录
 - [什么是GlueVAE？](#什么是gluevae)
 - [核心概念解释](#核心概念解释)
