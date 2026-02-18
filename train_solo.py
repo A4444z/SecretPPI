@@ -396,9 +396,8 @@ def main():
               f"kl={train_metrics['kl_loss']:.4f}")
         
         # 验证
-        # 对于小数据集，确保每个epoch都进行验证
-        should_validate = (len(train_loader) == 1) or ((epoch + 1) % max(1, val_interval // len(train_loader) + 1) == 0)
-        
+        val_interval_epochs = config['logging'].get('val_interval', 5) # 建议在 yaml 里把 1000 改成 5
+        should_validate = (epoch + 1) % val_interval_epochs == 0
         if should_validate:
             val_metrics = validate(
                 model, val_loader, criterion, device, epoch, config, wandb_logger
@@ -422,8 +421,8 @@ def main():
             global_step = (epoch + 1) * len(train_loader)
             save_checkpoint(model, optimizer, epoch, global_step, save_dir, is_best)
         else:
-            # 即使不验证，也考虑定期保存检查点
-            if (epoch + 1) % 1 == 0:  # 每个epoch都保存检查点用于测试
+            save_interval_epochs = config['logging'].get('save_interval', 10) # 建议去 config.yaml 把 5000 改成 10
+            if (epoch + 1) % save_interval_epochs == 0:  
                 global_step = (epoch + 1) * len(train_loader)
                 save_checkpoint(model, optimizer, epoch, global_step, save_dir, is_best=False)
     

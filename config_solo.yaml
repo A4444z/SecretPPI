@@ -56,8 +56,8 @@ logging:
   project: "GlueVAE"
   entity: null
   log_interval: 100
-  val_interval: 1000
-  save_interval: 5000
+  val_interval: 5
+  save_interval: 10
   save_dir: "checkpoints"
   use_wandb: false  # 设置为 true 启用 wandb
 
