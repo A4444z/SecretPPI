@@ -295,48 +295,24 @@ class GlueVAEDataset(Dataset):
         pos: torch.Tensor
     ) -> torch.Tensor:
         """
-        优化的图构建：使用 radius_graph 但限制每个节点的最大邻居数。
-        
-        参数:
-            pos: 原子坐标 [N, 3]
-        
-        返回:
-            edge_index: 优化后的边索引 [2, E]
+        优化的图构建（向量化版）：
+        策略：先用 KNN 限制最大邻居数，再用半径筛选。
+        这样既限制了边数，又保证了物理距离，且全程 GPU/C++ 加速。
         """
-        # 首先使用 radius_graph 获取所有4.5Å内的边
-        edge_index = radius_graph(pos, r=4.5, loop=False)  # [2, E]
-        
         if self.max_num_neighbors <= 0:
-            return edge_index
+            return radius_graph(pos, r=4.5, loop=False)
         
+        # 1. 先找最近的 max_num_neighbors (e.g. 32) 个邻居
+        # flow='target_to_source' 是 PyG 默认的消息传递方向
+        edge_index = knn_graph(pos, k=self.max_num_neighbors, loop=False, flow='target_to_source')
+        
+        # 2. 计算这些边的距离
         row, col = edge_index
+        dist = torch.norm(pos[row] - pos[col], p=2, dim=1)
         
-        # 计算每条边的距离
-        dist = torch.norm(pos[row] - pos[col], dim=1)
-        
-        # 对每个节点，只保留距离最近的max_num_neighbors个邻居
-        unique_nodes, inverse_indices = torch.unique(row, return_inverse=True)
-        
-        # 创建一个mask来选择要保留的边
-        keep_mask = torch.zeros_like(row, dtype=torch.bool)
-        
-        for node in unique_nodes:
-            node_mask = (row == node)
-            node_dist = dist[node_mask]
-            node_cols = col[node_mask]
-            
-            # 选择距离最近的max_num_neighbors个
-            if len(node_dist) > self.max_num_neighbors:
-                _, topk_indices = torch.topk(node_dist, k=self.max_num_neighbors, largest=False)
-                keep_mask[node_mask] = torch.isin(
-                    torch.arange(len(node_dist), device=node_dist.device),
-                    topk_indices
-                )
-            else:
-                keep_mask[node_mask] = True
-        
-        # 应用mask
-        edge_index = edge_index[:, keep_mask]
+        # 3. 再次应用半径阈值 (4.5A) 进行裁剪
+        mask = dist < 4.5
+        edge_index = edge_index[:, mask]
         
         return edge_index
     
