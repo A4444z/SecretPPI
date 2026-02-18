@@ -4,6 +4,7 @@ import pickle
 import lmdb
 import torch
 import numpy as np
+import json
 from torch_geometric.data import Dataset, Data
 from torch_cluster import radius_graph, knn_graph
 from torch_scatter import scatter_add
@@ -35,7 +36,8 @@ class GlueVAEDataset(Dataset):
         max_atoms: int = 1000,
         patch_radius: float = 15.0,
         max_num_neighbors: int = 32,
-        num_fps_points: int = 5
+        num_fps_points: int = 5,
+        exclude_pdb_json: Optional[str] = None
     ):
         """
         参数:
@@ -46,6 +48,7 @@ class GlueVAEDataset(Dataset):
             patch_radius: 补丁采样的半径阈值，单位Å，默认15.0。
             max_num_neighbors: 每个节点的最大邻居数，防止边数爆炸，默认32。
             num_fps_points: 使用最远点采样(FPS)生成的候选中心数量，默认5。
+            exclude_pdb_json: 包含需要排除的PDB ID的JSON文件路径（如CASF-2016）。
         """
         self.lmdb_path = lmdb_path or os.path.join(root, "processed_lmdb")
         self.split = split
@@ -55,6 +58,15 @@ class GlueVAEDataset(Dataset):
         self.num_fps_points = num_fps_points
         self._keys: Optional[List[bytes]] = None
         self._env: Optional[lmdb.Environment] = None
+        
+        # 加载需要排除的PDB ID
+        self.exclude_pdb_ids = set()
+        if exclude_pdb_json is not None and os.path.exists(exclude_pdb_json):
+            with open(exclude_pdb_json, 'r') as f:
+                exclude_data = json.load(f)
+                if 'all_pdb_ids' in exclude_data:
+                    self.exclude_pdb_ids = set(pdb_id.lower() for pdb_id in exclude_data['all_pdb_ids'])
+                    print(f"已加载 {len(self.exclude_pdb_ids)} 个需排除的PDB ID")
         
         # 用于维护每个样本的采样状态
         self._sample_states = {}
@@ -90,11 +102,28 @@ class GlueVAEDataset(Dataset):
             )
     
     def _load_keys(self):
-        """从数据库中加载所有数据的键 (Keys)。"""
+        """从数据库中加载所有数据的键 (Keys)，并排除指定的PDB ID。"""
         self._connect_db()
         if self._keys is None:
             with self._env.begin() as txn:
-                self._keys = [k for k, _ in txn.cursor()]
+                all_keys = [k for k, _ in txn.cursor()]
+                
+                # 如果有需要排除的PDB ID，进行过滤
+                if self.exclude_pdb_ids:
+                    filtered_keys = []
+                    excluded_count = 0
+                    for key in all_keys:
+                        # 从键中提取PDB ID: "1a30|A-B" -> "1a30"
+                        key_str = key.decode('utf-8')
+                        pdb_id = key_str.split('|')[0].lower()
+                        if pdb_id not in self.exclude_pdb_ids:
+                            filtered_keys.append(key)
+                        else:
+                            excluded_count += 1
+                    self._keys = filtered_keys
+                    print(f"过滤前: {len(all_keys)} 个样本，过滤后: {len(self._keys)} 个样本，排除: {excluded_count} 个样本")
+                else:
+                    self._keys = all_keys
     
     def len(self) -> int:
         """返回数据集样本总数。"""

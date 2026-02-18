@@ -1,0 +1,79 @@
+
+# GlueVAE 配置文件
+# 所有超参数设置
+
+# 数据配置
+data:
+  root_dir: "./"
+  lmdb_path: "data/processed_lmdb"
+  exclude_pdb_json: "database/CASF-2016_pdb_ids.json"
+  train_split: 0.9
+  val_split: 0.05
+  test_split: 0.05
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+
+# 模型配置
+model:
+  hidden_dim: 128
+  latent_dim: 32
+  num_encoder_layers: 6
+  num_decoder_layers: 4
+  edge_dim: 19
+  vocab_size: 101
+  use_gradient_checkpointing: true
+
+# 训练配置
+training:
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  max_grad_norm: 10.0
+  
+  # KL 散度退火配置
+  beta:
+    start: 0.0
+    end: 1.0
+    warmup_steps: 10000
+    schedule_type: "linear"  # linear, cyclic, step
+  
+  # 优化器配置
+  optimizer:
+    type: "Adam"
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  
+  # 学习率调度器
+  scheduler:
+    type: "ReduceLROnPlateau"
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+# 日志和保存配置
+logging:
+  project: "GlueVAE"
+  entity: null
+  log_interval: 100
+  val_interval: 1000
+  save_interval: 5000
+  save_dir: "checkpoints"
+  use_wandb: false  # 设置为 true 启用 wandb
+
+# 几何配置
+geometry:
+  cutoff: 4.5
+  rbf_dim: 16
+  contact_cutoff: 4.0
+
+# SE(3) 数据增强
+augmentation:
+  train:
+    random_rotation: true
+    random_translation: false
+    translation_std: 0.1
+  val:
+    random_rotation: false
+    random_translation: false
+
