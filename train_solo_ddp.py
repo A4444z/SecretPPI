@@ -137,7 +137,7 @@ def train_epoch(
         if rank == 0 and epoch == 0 and batch_idx == 0:
             bad_grad = False
             for n, p in model.named_parameters():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                     print(f"[DEBUG] bad grad in: {n}")
                     bad_grad = True
                     break

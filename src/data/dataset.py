@@ -83,6 +83,17 @@ class GlueVAEDataset(Dataset):
         
         super().__init__(root, transform, pre_transform)
     
+    def __getstate__(self):
+        """
+        这个方法极其重要！
+        当 PyTorch DataLoader 使用多进程 (num_workers > 0) 时，
+        它会把 Dataset 序列化发给子进程。
+        如果不把 _env 置为 None，子进程会共享主进程的 LMDB 句柄导致死锁！
+        """
+        state = self.__dict__.copy()
+        state['_env'] = None  # 强制子进程自己重新初始化 LMDB 连接
+        return state
+
     @property
     def raw_file_names(self) -> List[str]:
         return []

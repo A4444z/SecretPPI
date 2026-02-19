@@ -10,8 +10,8 @@ data:
   train_split: 0.9
   val_split: 0.05
   test_split: 0.05
-  batch_size: 4
-  num_workers: 4
+  batch_size: 32
+  num_workers: 8
   pin_memory: true
 
 # 模型配置
@@ -27,7 +27,7 @@ model:
 # 训练配置
 training:
   num_epochs: 100
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-3
   weight_decay: 1.0e-6
   max_grad_norm: 10.0
   
