@@ -20,7 +20,7 @@ export LD_LIBRARY_PATH=/apps/gpu/cuda/v12.6.1/lib64:$LD_LIBRARY_PATH
 module load soft/anaconda3/config
 source activate
 conda activate secret
-
+export WANDB_API_KEY="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"
 # 设置工作目录
 cd /home/fit/liulei/WORK/SecretPPI
 

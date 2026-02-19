@@ -37,7 +37,9 @@ class GlueVAEDataset(Dataset):
         patch_radius: float = 15.0,
         max_num_neighbors: int = 32,
         num_fps_points: int = 5,
-        exclude_pdb_json: Optional[str] = None
+        exclude_pdb_json: Optional[str] = None,
+        random_rotation: bool = True,
+        max_samples: Optional[int] = None
     ):
         """
         参数:
@@ -49,6 +51,7 @@ class GlueVAEDataset(Dataset):
             max_num_neighbors: 每个节点的最大邻居数，防止边数爆炸，默认32。
             num_fps_points: 使用最远点采样(FPS)生成的候选中心数量，默认5。
             exclude_pdb_json: 包含需要排除的PDB ID的JSON文件路径（如CASF-2016）。
+            max_samples: 最多加载多少个样本，None 表示全部加载。
         """
         self.lmdb_path = lmdb_path or os.path.join(root, "processed_lmdb")
         self.split = split
@@ -56,6 +59,7 @@ class GlueVAEDataset(Dataset):
         self.patch_radius = patch_radius
         self.max_num_neighbors = max_num_neighbors
         self.num_fps_points = num_fps_points
+        self.max_samples = max_samples
         self._keys: Optional[List[bytes]] = None
         self._env: Optional[lmdb.Environment] = None
         
@@ -67,6 +71,9 @@ class GlueVAEDataset(Dataset):
                 if 'all_pdb_ids' in exclude_data:
                     self.exclude_pdb_ids = set(pdb_id.lower() for pdb_id in exclude_data['all_pdb_ids'])
                     print(f"已加载 {len(self.exclude_pdb_ids)} 个需排除的PDB ID")
+        
+        # 新增：是否随机旋转
+        self.random_rotation = random_rotation
         
         # 用于维护每个样本的采样状态
         self._sample_states = {}
@@ -102,29 +109,52 @@ class GlueVAEDataset(Dataset):
             )
     
     def _load_keys(self):
-        """从数据库中加载所有数据的键 (Keys)，并排除指定的PDB ID。"""
+        """从数据库中加载 Keys，支持快速截断和排除。"""
         self._connect_db()
+        
+        # 优先尝试读取缓存 (保留这个好习惯)
+        cache_path = os.path.join(self.lmdb_path, f"keys_cache_{self.split}.pkl")
+        if self._keys is None and os.path.exists(cache_path) and self.max_samples is None:
+             # 注意：只有在不限制数量(全量)时才读全量缓存，否则还是得去读 DB 截取
+            print(f"Loading keys from cache: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                self._keys = pickle.load(f)
+            return
+
         if self._keys is None:
+            self._keys = []
             with self._env.begin() as txn:
-                all_keys = [k for k, _ in txn.cursor()]
+                cursor = txn.cursor()
                 
-                # 如果有需要排除的PDB ID，进行过滤
-                if self.exclude_pdb_ids:
-                    filtered_keys = []
-                    excluded_count = 0
-                    for key in all_keys:
-                        # 从键中提取PDB ID: "1a30|A-B" -> "1a30"
-                        key_str = key.decode('utf-8')
-                        pdb_id = key_str.split('|')[0].lower()
-                        if pdb_id not in self.exclude_pdb_ids:
-                            filtered_keys.append(key)
-                        else:
-                            excluded_count += 1
-                    self._keys = filtered_keys
-                    print(f"过滤前: {len(all_keys)} 个样本，过滤后: {len(self._keys)} 个样本，排除: {excluded_count} 个样本")
-                else:
-                    self._keys = all_keys
-    
+                print(f"Scanning LMDB (Max samples: {self.max_samples})...")
+                
+                for k, _ in cursor:
+                    # 1. 如果有排除列表，立即检查
+                    if self.exclude_pdb_ids:
+                        try:
+                            # 简单解析 Key，格式通常是 b'1a2k|A-B'
+                            key_str = k.decode('utf-8')
+                            pdb_id = key_str.split('|')[0].lower()
+                            if pdb_id in self.exclude_pdb_ids:
+                                continue # 命中黑名单，跳过，不计数
+                        except:
+                            continue # 格式错误，跳过
+                    
+                    # 2. 通过筛选，加入列表
+                    self._keys.append(k)
+                    
+                    # 3. 检查是否凑够了数量
+                    if self.max_samples is not None and len(self._keys) >= self.max_samples:
+                        print(f"Reached max_samples ({self.max_samples}), stopping early.")
+                        break
+            
+            print(f"Loaded {len(self._keys)} samples.")
+            
+            # 只有在全量读取（没有限制）时才保存缓存，防止存了个残缺版
+            if self.max_samples is None:
+                print(f"Saving keys to cache: {cache_path}")
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(self._keys, f)
     def len(self) -> int:
         """返回数据集样本总数。"""
         self._load_keys()
@@ -430,9 +460,16 @@ class GlueVAEDataset(Dataset):
         pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index = self._dynamic_patch_sampling(
             key, pos, z, residue_index, is_ligand, mask_interface
         )
+
+        # =========== ✅ 核心修复：坐标去中心化 ===========
+        # 这一步能救你的 Loss = NaN
+        if pos.shape[0] > 0:
+            pos_center = pos.mean(dim=0, keepdim=True)
+            pos = pos - pos_center
+        # ===============================================
         
         # 5. 数据增强 (随机旋转) - 在Patch Sampling之后
-        if self.split == 'train':
+        if self.split == 'train' and self.random_rotation:
             rot_mat = get_random_rotation_matrix()
             pos = apply_rotation(pos, rot_mat)
         

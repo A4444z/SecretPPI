@@ -6,13 +6,13 @@
 # 数据配置
 data:
   root_dir: "./"
-  lmdb_path: "data/processed_lmdb"
+  lmdb_path: "database/3DComplex/processed_lmdb"
   exclude_pdb_json: "database/CASF-2016_pdb_ids.json"
   train_split: 0.9
   val_split: 0.05
   test_split: 0.05
   batch_size: 4  # 过拟合测试时保持小批量
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
 
 # 模型配置
@@ -60,7 +60,7 @@ logging:
   val_interval: 10  # 每10个epoch验证
   save_interval: 100  # 每100个epoch保存
   save_dir: "checkpoints_overfit"
-  use_wandb: false
+  use_wandb: true
 
 # 几何配置
 geometry:

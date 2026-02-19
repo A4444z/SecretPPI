@@ -82,6 +82,19 @@ def train_epoch(
     for batch_idx, batch in enumerate(pbar):
         batch = batch.to(device)
         
+        # ================= 🚨 快速数据体检 (只在第一步打印) 🚨 =================
+        if epoch == 0 and batch_idx == 0:
+            print("\n" + "="*40)
+            print("🚀 首批数据健康体检报告")
+            print(f"  总原子数: {batch.pos.size(0)}")
+            print(f"  [pos] 是否含 NaN/Inf: {torch.isnan(batch.pos).any().item() or torch.isinf(batch.pos).any().item()}")
+            print(f"  [pos] 数值范围: 最小值 {batch.pos.min().item():.2f}, 最大值 {batch.pos.max().item():.2f}")
+            print(f"  [x (原子序数)] 是否含 NaN: {torch.isnan(batch.x).any().item()}")
+            print(f"  [edge_attr] 是否含 NaN: {torch.isnan(batch.edge_attr).any().item()}")
+            print(f"  [vector_features] 是否含 NaN: {torch.isnan(batch.vector_features).any().item()}")
+            print("="*40 + "\n")
+        # ====================================================================
+
         # 前向传播
         pos_pred, mu, logvar = model(
             z=batch.x,
@@ -92,6 +105,16 @@ def train_epoch(
             residue_index=batch.residue_index
         )
         
+        # ====== [新增] 前向数值体检（建议只在首步打印）======
+        if epoch == 0 and batch_idx == 0:
+            print("\n[DEBUG] forward finite check")
+            print("  pos_pred finite:", torch.isfinite(pos_pred).all().item())
+            print("  mu finite:", torch.isfinite(mu).all().item())
+            print("  logvar finite:", torch.isfinite(logvar).all().item())
+            print(f"  logvar range: [{logvar.min().item():.4f}, {logvar.max().item():.4f}]")
+            print(f"  pos_pred range: [{pos_pred.min().item():.4f}, {pos_pred.max().item():.4f}]")
+        # ================================================
+
         # 更新 beta
         beta = beta_scheduler.update()
         criterion.beta = beta
@@ -105,10 +128,29 @@ def train_epoch(
             mask=batch.mask_interface, batch_idx=batch.batch
         )
         
+                # ====== [新增] loss 体检 ======
+        if epoch == 0 and batch_idx == 0:
+            print("\n[DEBUG] loss finite check")
+            print("  loss finite:", torch.isfinite(loss).item())
+            print("  recon finite:", torch.isfinite(recon_loss).item())
+            print("  kl finite:", torch.isfinite(kl_loss).item())
+        # ==============================
+
         # 反向传播
         optimizer.zero_grad()
         loss.backward()
         
+                # ====== [新增] 梯度体检 ======
+        if epoch == 0 and batch_idx == 0:
+            bad_grad = False
+            for n, p in model.named_parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    print(f"[DEBUG] bad grad in: {n}")
+                    bad_grad = True
+                    break
+            print("  grad finite:", not bad_grad)
+        # =============================
+
         # 梯度裁剪
         max_grad_norm = config['training']['max_grad_norm']
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -261,50 +303,66 @@ def main():
     # 设置 wandb
     wandb_logger = setup_wandb(config)
     
+
+    # 安全读取配置（防止旧 config 没有这些键报错）
+    aug_config = config.get('augmentation', {})
+    train_aug = aug_config.get('train', {})
+    use_rotation = train_aug.get('random_rotation', True)
+    
     # 加载数据集
     print("Loading dataset...")
-    full_dataset = GlueVAEDataset(
-        root=config['data']['root_dir'],
-        lmdb_path=config['data']['lmdb_path'],
-        split='train',
-        exclude_pdb_json=config['data'].get('exclude_pdb_json')
-    )
     
-    # 划分训练集和验证集
-    total_len = len(full_dataset)
-    
-    if total_len == 1:
-        # 如果只有一个样本，就让它既作为训练集又作为验证集
-        train_dataset = full_dataset
-        val_dataset = full_dataset
-        print("Warning: Only one sample in dataset, using it for both train and validation")
-    else:
-        train_len = max(1, int(total_len * config['data']['train_split']))  # 确保训练集至少有1个样本
-        val_len = max(1, total_len - train_len)  # 确保验证集至少有1个样本
-        
-        if train_len + val_len > total_len:  # 如果超过总数，调整为各一半
-            train_len = total_len // 2
-            val_len = total_len - train_len
-        
-        train_dataset, val_dataset = random_split(
-            full_dataset, [train_len, val_len],
-            generator=torch.Generator().manual_seed(args.seed)
-        )
-    
-    print(f"Total dataset size: {total_len}")
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size: {len(val_dataset)}")
-    
+    # 过拟合测试模式：直接在数据集级别限制样本数量，避免加载全部数据
     if args.overfit_test:
         print("!!! RUNNING IN OVERFIT TEST MODE !!!")
-        # 强制只取前 batch_size 个样本
-        subset_indices = list(range(config['data']['batch_size']))
-        from torch.utils.data import Subset
-        tiny_subset = Subset(full_dataset, subset_indices)
+        batch_size = config['data']['batch_size']
+        print(f"Overfit test: 限制数据集大小为 {batch_size} 个样本，禁用 PDB 排除以加快加载速度")
+        full_dataset = GlueVAEDataset(
+            root=config['data']['root_dir'],
+            lmdb_path=config['data']['lmdb_path'],
+            split='train',
+            exclude_pdb_json=None,  # 过拟合模式下不排除任何 PDB，加速加载
+            random_rotation=use_rotation,
+            max_samples=batch_size
+        )
         # 让训练集和验证集完全一样，测试死记硬背能力
-        train_dataset = tiny_subset
-        val_dataset = tiny_subset
+        train_dataset = full_dataset
+        val_dataset = full_dataset
         print(f"Overfit test: Using {len(train_dataset)} samples for both train and val")
+    else:
+        # 正常训练模式
+        full_dataset = GlueVAEDataset(
+            root=config['data']['root_dir'],
+            lmdb_path=config['data']['lmdb_path'],
+            split='train',
+            exclude_pdb_json=config['data'].get('exclude_pdb_json'),
+            random_rotation=use_rotation
+        )
+        
+        # 划分训练集和验证集
+        total_len = len(full_dataset)
+        
+        if total_len == 1:
+            # 如果只有一个样本，就让它既作为训练集又作为验证集
+            train_dataset = full_dataset
+            val_dataset = full_dataset
+            print("Warning: Only one sample in dataset, using it for both train and validation")
+        else:
+            train_len = max(1, int(total_len * config['data']['train_split']))
+            val_len = max(1, total_len - train_len)
+            
+            if train_len + val_len > total_len:
+                train_len = total_len // 2
+                val_len = total_len - train_len
+            
+            train_dataset, val_dataset = random_split(
+                full_dataset, [train_len, val_len],
+                generator=torch.Generator().manual_seed(args.seed)
+            )
+        
+        print(f"Total dataset size: {total_len}")
+        print(f"Train dataset size: {len(train_dataset)}")
+        print(f"Val dataset size: {len(val_dataset)}")
     
     # 创建 DataLoader
     train_loader = PyGDataLoader(

@@ -243,6 +243,9 @@ class GlueVAE(nn.Module):
         z = mu + sigma * epsilon, epsilon ~ N(0, 1)
         """
         if self.training:
+            # ====== [新增] 防溢出 clamp ======
+            logvar = torch.clamp(logvar, min=-20.0, max=20.0)
+            # ================================
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + eps * std
@@ -261,16 +264,37 @@ class GlueVAE(nn.Module):
         """
         编码过程：输入 -&gt; 潜在分布参数。
         """
-        # PaiNN 编码器
+                # PaiNN 编码器
         s, v = self.encoder(z, vector_features, edge_index, edge_attr, pos)
-        
-        # 原子 -&gt; 残基 Pooling
+
+        # 原子 -> 残基 Pooling
         res_features = self.residue_pooling(s, residue_index)
-        
+
+        # ===== [DEBUG] 一次性打印 =====
+        if not hasattr(self, "_debug_once_encode"):
+            self._debug_once_encode = False
+        if not self._debug_once_encode:
+            print("\n[DEBUG][GlueVAE.encode]")
+            print("  s finite:", torch.isfinite(s).all().item())
+            print("  residue_index min/max:", int(residue_index.min()), int(residue_index.max()))
+            print("  residue unique:", int(residue_index.unique().numel()),
+                " / max+1:", int(residue_index.max().item()) + 1)
+            print("  res_features finite:", torch.isfinite(res_features).all().item(),
+                "shape:", tuple(res_features.shape))
+        # ============================
+
         # 潜在分布
         mu, logvar = self.latent_encoder(res_features)
-        
+
+        if not self._debug_once_encode:
+            print("  mu finite:", torch.isfinite(mu).all().item())
+            print("  logvar finite:", torch.isfinite(logvar).all().item())
+            if torch.isfinite(logvar).all():
+                print("  logvar range:", float(logvar.min()), float(logvar.max()))
+            self._debug_once_encode = True
+
         return mu, logvar
+
         
     def decode(
         self,
@@ -330,6 +354,13 @@ class GlueVAE(nn.Module):
             z, vector_features, edge_index, edge_attr, pos, residue_index
         )
         
+        # ===== [DEBUG ASSERT] =====
+        if not torch.isfinite(mu).all():
+            raise RuntimeError("mu contains NaN/Inf right after encode()")
+        if not torch.isfinite(logvar).all():
+            raise RuntimeError("logvar contains NaN/Inf right after encode()")
+        # ==========================
+
         # 重参数化采样
         z_latent = self.reparameterize(mu, logvar)
         

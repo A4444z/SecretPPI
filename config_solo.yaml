@@ -5,7 +5,7 @@
 # 数据配置
 data:
   root_dir: "./"
-  lmdb_path: "data/processed_lmdb"
+  lmdb_path: "database/3DComplex/processed_lmdb"
   exclude_pdb_json: "database/CASF-2016_pdb_ids.json"
   train_split: 0.9
   val_split: 0.05
@@ -27,7 +27,7 @@ model:
 # 训练配置
 training:
   num_epochs: 100
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-5
   weight_decay: 1.0e-6
   max_grad_norm: 10.0
   
@@ -59,7 +59,7 @@ logging:
   val_interval: 5
   save_interval: 10
   save_dir: "checkpoints"
-  use_wandb: false  # 设置为 true 启用 wandb
+  use_wandb: true  # 设置为 true 启用 wandb
 
 # 几何配置
 geometry:

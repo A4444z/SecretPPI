@@ -34,28 +34,28 @@ def main():
                         help='Check interval in seconds (default: 60)')
     args = parser.parse_args()
     
-    print(f"WatchAndRun started")
-    print(f"Watching PID: {args.pid}")
-    print(f"Command to run: {args.cmd}")
-    print(f"Check interval: {args.check_interval} seconds")
-    print("-" * 50)
+    print(f"WatchAndRun started", flush=True)
+    print(f"Watching PID: {args.pid}", flush=True)
+    print(f"Command to run: {args.cmd}", flush=True)
+    print(f"Check interval: {args.check_interval} seconds", flush=True)
+    print("-" * 50, flush=True)
     
     try:
         # 监控循环
         while True:
             if check_pid_exists(args.pid):
                 current_time = time.strftime('%Y-%m-%d %H:%M:%S')
-                print(f"[{current_time}] Waiting for PID {args.pid} to finish...")
+                print(f"[{current_time}] Waiting for PID {args.pid} to finish...", flush=True)
                 time.sleep(args.check_interval)
             else:
                 break
         
         # 进程已结束
         current_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        print("-" * 50)
-        print(f"[{current_time}] PID {args.pid} has finished!")
-        print(f"Executing command: {args.cmd}")
-        print("-" * 50)
+        print("-" * 50, flush=True)
+        print(f"[{current_time}] PID {args.pid} has finished!", flush=True)
+        print(f"Executing command: {args.cmd}", flush=True)
+        print("-" * 50, flush=True)
         
         # 执行命令
         result = subprocess.run(args.cmd, shell=True)
