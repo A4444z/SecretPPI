@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import random_split, DistributedSampler
+from torch.utils.data import random_split, DistributedSampler, Subset
 from torch_geometric.loader import DataLoader as PyGDataLoader
 import yaml
 from tqdm import tqdm
@@ -328,39 +328,58 @@ def main():
         val_dataset = full_dataset
         if rank == 0:
             print(f"Overfit test: Using {len(train_dataset)} samples for both train and val")
-    else:
-        full_dataset = GlueVAEDataset(
-            root=config['data']['root_dir'],
-            lmdb_path=config['data']['lmdb_path'],
-            split='train',
-            exclude_pdb_json=config['data'].get('exclude_pdb_json'),
-            random_rotation=use_rotation
-        )
-        
-        total_len = len(full_dataset)
-        
-        if total_len == 1:
-            train_dataset = full_dataset
-            val_dataset = full_dataset
-            if rank == 0:
-                print("Warning: Only one sample in dataset, using it for both train and validation")
         else:
-            train_len = max(1, int(total_len * config['data']['train_split']))
-            val_len = max(1, total_len - train_len)
-            
-            if train_len + val_len > total_len:
-                train_len = total_len // 2
-                val_len = total_len - train_len
-            
-            train_dataset, val_dataset = random_split(
-                full_dataset, [train_len, val_len],
-                generator=torch.Generator().manual_seed(args.seed)
+            val_aug = aug_config.get('val', {})
+            val_use_rotation = val_aug.get('random_rotation', False)
+
+            train_full_dataset = GlueVAEDataset(
+                root=config['data']['root_dir'],
+                lmdb_path=config['data']['lmdb_path'],
+                split='train',
+                exclude_pdb_json=config['data'].get('exclude_pdb_json'),
+                random_rotation=use_rotation
             )
+
+            val_full_dataset = GlueVAEDataset(
+                root=config['data']['root_dir'],
+                lmdb_path=config['data']['lmdb_path'],
+                split='val',
+                exclude_pdb_json=config['data'].get('exclude_pdb_json'),
+                random_rotation=val_use_rotation
+            )
+
+            total_len = len(train_full_dataset)
+
+            if total_len == 1:
+                train_dataset = train_full_dataset
+                val_dataset = val_full_dataset
+                if rank == 0:
+                    print("Warning: Only one sample in dataset, using it for both train and validation")
+            else:
+                train_len = max(1, int(total_len * config['data']['train_split']))
+                val_len = max(1, total_len - train_len)
+
+                if train_len + val_len > total_len:
+                    train_len = total_len // 2
+                    val_len = total_len - train_len
+
+                indices = torch.randperm(
+                    total_len,
+                    generator=torch.Generator().manual_seed(args.seed)
+                ).tolist()
+
+                train_indices = indices[:train_len]
+                val_indices = indices[train_len:train_len + val_len]
+
+                train_dataset = Subset(train_full_dataset, train_indices)
+                val_dataset = Subset(val_full_dataset, val_indices)
+
+            if rank == 0:
+                print(f"Total dataset size: {total_len}")
+                print(f"Train dataset size: {len(train_dataset)}")
+                print(f"Val dataset size: {len(val_dataset)}")
+
         
-        if rank == 0:
-            print(f"Total dataset size: {total_len}")
-            print(f"Train dataset size: {len(train_dataset)}")
-            print(f"Val dataset size: {len(val_dataset)}")
     
     train_sampler = DistributedSampler(
         train_dataset,
@@ -381,7 +400,8 @@ def main():
         batch_size=config['data']['batch_size'],
         sampler=train_sampler,
         num_workers=config['data']['num_workers'],
-        pin_memory=config['data']['pin_memory']
+        pin_memory=config['data']['pin_memory'],
+        persistent_workers=(config['data']['num_workers'] > 0)
     )
     
     val_loader = PyGDataLoader(
@@ -389,7 +409,8 @@ def main():
         batch_size=config['data']['batch_size'],
         sampler=val_sampler,
         num_workers=config['data']['num_workers'],
-        pin_memory=config['data']['pin_memory']
+        pin_memory=config['data']['pin_memory'],
+        persistent_workers=(config['data']['num_workers'] > 0)
     )
     
     if rank == 0:
@@ -481,7 +502,8 @@ def main():
                   f"kl={train_metrics['kl_loss']:.4f}")
         
         val_interval_epochs = config['logging'].get('val_interval', 5)
-        should_validate = (epoch + 1) % val_interval_epochs == 0
+        # 🔴 新增逻辑：达到间隔，或者是最后一个 Epoch，强制进行验证！
+        should_validate = (epoch + 1) % val_interval_epochs == 0 or (epoch == config['training']['num_epochs'] - 1)
         
         if should_validate:
             val_sampler.set_epoch(epoch)
