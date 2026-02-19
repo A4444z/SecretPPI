@@ -108,53 +108,68 @@ class GlueVAEDataset(Dataset):
                 meminit=False
             )
     
-    def _load_keys(self):
-        """从数据库中加载 Keys，支持快速截断和排除。"""
-        self._connect_db()
-        
-        # 优先尝试读取缓存 (保留这个好习惯)
-        cache_path = os.path.join(self.lmdb_path, f"keys_cache_{self.split}.pkl")
-        if self._keys is None and os.path.exists(cache_path) and self.max_samples is None:
-             # 注意：只有在不限制数量(全量)时才读全量缓存，否则还是得去读 DB 截取
-            print(f"Loading keys from cache: {cache_path}")
-            with open(cache_path, 'rb') as f:
-                self._keys = pickle.load(f)
-            return
-
-        if self._keys is None:
-            self._keys = []
-            with self._env.begin() as txn:
-                cursor = txn.cursor()
-                
-                print(f"Scanning LMDB (Max samples: {self.max_samples})...")
-                
-                for k, _ in cursor:
-                    # 1. 如果有排除列表，立即检查
-                    if self.exclude_pdb_ids:
-                        try:
-                            # 简单解析 Key，格式通常是 b'1a2k|A-B'
-                            key_str = k.decode('utf-8')
-                            pdb_id = key_str.split('|')[0].lower()
-                            if pdb_id in self.exclude_pdb_ids:
-                                continue # 命中黑名单，跳过，不计数
-                        except:
-                            continue # 格式错误，跳过
-                    
-                    # 2. 通过筛选，加入列表
-                    self._keys.append(k)
-                    
-                    # 3. 检查是否凑够了数量
-                    if self.max_samples is not None and len(self._keys) >= self.max_samples:
-                        print(f"Reached max_samples ({self.max_samples}), stopping early.")
-                        break
-            
-            print(f"Loaded {len(self._keys)} samples.")
-            
-            # 只有在全量读取（没有限制）时才保存缓存，防止存了个残缺版
-            if self.max_samples is None:
-                print(f"Saving keys to cache: {cache_path}")
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(self._keys, f)
+    def _load_keys(self): 
+        """从数据库中加载 Keys，支持完整缓存与快速调试截断。""" 
+        self._connect_db() 
+         
+        # 缓存文件路径 
+        cache_path = os.path.join(self.lmdb_path, f"keys_cache_{self.split}.pkl") 
+         
+        # ================= 情景 1：全量模式且存在缓存 -> 秒速读取 ================= 
+        if self._keys is None and self.max_samples is None and os.path.exists(cache_path): 
+            print("\n" + "="*60) 
+            print(f"🚀 [CACHE HIT] 发现全量缓存文件，正在秒速加载！") 
+            print(f"📂 路径: {cache_path}") 
+            with open(cache_path, 'rb') as f: 
+                self._keys = pickle.load(f) 
+            print(f"✅ 成功从缓存加载 {len(self._keys)} 个样本！启动起飞！") 
+            print("="*60 + "\n") 
+            return 
+ 
+        # ================= 情景 2：无缓存 或 处于限制数量的调试模式 ================= 
+        if self._keys is None: 
+            self._keys = [] 
+            print("\n" + "="*60) 
+            if self.max_samples is not None: 
+                print(f"⚠️ [DEBUG MODE] 当前限制最大读取数量: {self.max_samples}") 
+            else: 
+                print("⏳ [CACHE MISS] 未找到缓存，正在遍历 LMDB 数据库...") 
+                print("   （因为走网络文件系统，这可能需要几分钟到几十分钟，请喝杯咖啡）") 
+             
+            with self._env.begin() as txn: 
+                cursor = txn.cursor() 
+                 
+                for k, _ in cursor: 
+                    # 1. 黑名单过滤 (例如 CASF-2016) 
+                    if self.exclude_pdb_ids: 
+                        try: 
+                            key_str = k.decode('utf-8') 
+                            pdb_id = key_str.split('|')[0].lower() 
+                            if pdb_id in self.exclude_pdb_ids: 
+                                continue # 命中黑名单，直接跳过 
+                        except: 
+                            continue # 格式错误跳过 
+                     
+                    # 2. 通过筛选，加入列表 
+                    self._keys.append(k) 
+                     
+                    # 3. 截断判断：一旦凑够了我们需要的数量，立刻掀桌子走人！ 
+                    if self.max_samples is not None and len(self._keys) >= self.max_samples: 
+                        print(f"🛑 已达到最大样本数限制 ({self.max_samples})，提前终止遍历！") 
+                        break 
+             
+            print(f"✅ 本次实际遍历加载了 {len(self._keys)} 个样本。") 
+             
+            # ================= 情景 3：全量模式下保存缓存 ================= 
+            if self.max_samples is None: 
+                print(f"💾 [SAVING CACHE] 正在将全量目录保存到缓存文件...") 
+                with open(cache_path, 'wb') as f: 
+                    pickle.dump(self._keys, f) 
+                print(f"🎉 缓存保存成功！文件位置: {cache_path}") 
+                print(f"   下一次启动训练将只需 1 秒钟！") 
+            else: 
+                print("🚫 [NO CACHE] 提示：当前为局部调试模式，为了防止缓存被污染，本次【不保存】缓存。") 
+            print("="*60 + "\n")
     def len(self) -> int:
         """返回数据集样本总数。"""
         self._load_keys()
