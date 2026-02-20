@@ -11,8 +11,8 @@ data:
   val_split: 0.05
   test_split: 0.05
   batch_size: 16
-  num_workers: 8
-  pin_memory: true
+  num_workers: 4
+  pin_memory: false
 
 # 模型配置
 model:

@@ -83,6 +83,14 @@ class GlueVAEDataset(Dataset):
         
         super().__init__(root, transform, pre_transform)
     
+    def _process(self):
+        """
+        覆盖并禁用 PyG 默认的 _process 逻辑。
+        因为我们的数据在 LMDB 中直接读取，不需要 PyG 在 processed/ 下生成无用的 .pt 文件。
+        这彻底根除了多卡并发读写 NFS 导致的 _pickle.UnpicklingError！
+        """
+        pass
+
     def __getstate__(self):
         """
         这个方法极其重要！
@@ -109,15 +117,23 @@ class GlueVAEDataset(Dataset):
         pass
     
     def _connect_db(self):
-        """建立与 LMDB 数据库的连接。"""
-        if self._env is None:
+        import os
+        current_pid = os.getpid()
+        
+        # 🚨 核心修复：如果环境未初始化，或者发现自己是子进程（PID 变了）
+        if getattr(self, '_env', None) is None or getattr(self, '_env_pid', None) != current_pid:
+            import lmdb
+            
+            # (可选) 如果子进程继承了旧环境，我们不关闭它（防止影响其他进程），直接覆盖
             self._env = lmdb.open(
-                self.lmdb_path, 
-                readonly=True, 
-                lock=False, 
-                readahead=False, 
-                meminit=False
+                self.lmdb_path,
+                readonly=True,
+                lock=False,       # 抵御 NFS 锁崩溃
+                readahead=False,  # 防止预读导致内存泄漏
+                meminit=False,    # 加速读取
+                max_readers=1024  # 增大并发上限
             )
+            self._env_pid = current_pid  # 记住当前环境是谁开的
     
     def _load_keys(self): 
         """从数据库中加载 Keys，支持完整缓存与快速调试截断。""" 
@@ -145,7 +161,7 @@ class GlueVAEDataset(Dataset):
                 print(f"⚠️ [DEBUG MODE] 当前限制最大读取数量: {self.max_samples}") 
             else: 
                 print("⏳ [CACHE MISS] 未找到缓存，正在遍历 LMDB 数据库...") 
-                print("   （因为走网络文件系统，这可能需要几分钟到几十分钟，请喝杯咖啡）") 
+                print("   （因为走网络文件系统，这可能需要5 h，请喝100杯咖啡）") 
              
             with self._env.begin() as txn: 
                 cursor = txn.cursor() 
@@ -232,14 +248,7 @@ class GlueVAEDataset(Dataset):
     ) -> Tuple[List[int], int]:
         """
         获取或创建样本的采样状态。
-        
-        参数:
-            key: 数据键
-            pos: 原子坐标 [N, 3]
-            mask_interface: 界面掩码 [N]
-        
-        返回:
-            (candidate_centers, current_index): 候选中心列表和当前索引
+        【工程防线】：加入极端异常样本兜底保护。
         """
         key_str = key.decode('utf-8')
         
@@ -247,11 +256,15 @@ class GlueVAEDataset(Dataset):
             # 第一次访问该样本，生成FPS候选中心
             interface_indices = torch.where(mask_interface == 1)[0]
             
+            # ================= 🚨 工程防线 =================
+            # 如果没有任何界面原子，退化为从全体原子中选中心
+            if len(interface_indices) == 0:
+                interface_indices = torch.arange(pos.size(0), device=pos.device)
+            # ===============================================
+            
             if len(interface_indices) < self.num_fps_points:
-                # 界面原子不够，使用所有界面原子
                 candidate_indices = interface_indices
             else:
-                # 对界面原子进行FPS
                 interface_pos = pos[interface_indices]
                 fps_indices_in_interface = self._farthest_point_sampling(
                     interface_pos,
@@ -259,8 +272,12 @@ class GlueVAEDataset(Dataset):
                 )
                 candidate_indices = interface_indices[fps_indices_in_interface]
             
+            cand_list = candidate_indices.tolist()
+            if not cand_list:
+                cand_list = [0] if pos.size(0) > 0 else []
+                
             self._sample_states[key_str] = {
-                'candidate_centers': candidate_indices.tolist(),
+                'candidate_centers': cand_list,
                 'current_index': 0
             }
         
@@ -270,15 +287,13 @@ class GlueVAEDataset(Dataset):
     def _update_sample_state(self, key: bytes):
         """
         更新样本的采样状态，移动到下一个候选中心。
-        
-        参数:
-            key: 数据键
         """
         key_str = key.decode('utf-8')
         if key_str in self._sample_states:
             state = self._sample_states[key_str]
-            state['current_index'] = (state['current_index'] + 1) % len(state['candidate_centers'])
-    
+            if len(state['candidate_centers']) > 0:
+                state['current_index'] = (state['current_index'] + 1) % len(state['candidate_centers'])
+
     def _dynamic_patch_sampling(
         self,
         key: bytes,
@@ -417,83 +432,98 @@ class GlueVAEDataset(Dataset):
     
     def get(self, idx: int) -> Data:
         """
-        获取索引为 idx 的数据样本并构建 PyG Data 对象（优化版）。
-        
-        处理流程：
-        1. 从LMDB读取原始数据
-        2. 构建基本标记（is_ligand）
-        3. 计算界面掩码
-        4. Dynamic Patch Sampling（如需要）
-        5. 数据增强（随机旋转）
-        6. 优化图构建
-        7. 鲁棒的向量特征计算
-        8. 构建最终的Data对象
+        获取索引为 idx 的数据样本并构建 PyG Data 对象。
+        【科学防线】：针对 Train 集进行异常过滤重采样，针对 Val/Test 记录并执行兜底。
         """
+        import random
         self._connect_db()
         if self._keys is None:
             self._load_keys()
             
-        key = self._keys[idx]
-        with self._env.begin() as txn:
-            byte_data = txn.get(key)
-            data_dict = pickle.loads(byte_data)
-            
-        # 1. 提取基础数组
-        pos = torch.from_numpy(data_dict['pos']).float()  # 原子坐标 [N, 3]
-        z = torch.from_numpy(data_dict['z']).long()       # 原子序数/元素索引 [N]
-        residue_index = torch.from_numpy(data_dict['residue_index']).long()  # 原子所属残基索引 [N]
-        res_keys = data_dict['residue_keys']
-        meta = data_dict['meta']
-        chain_a, chain_b = meta['chains']
+        # ================= 🚨 科学防线与日志系统 =================
+        # Codex 建议 1：只在训练集允许重试，验证/测试集遇到直接跳过重采样，走底层兜底
+        max_retries = 10 if self.split == 'train' else 1
         
-        # 2. 确定 is_ligand (用于区分受体和配体，0代表受体，1代表配体)
-        res_to_batch = []
-        for rk in res_keys:
-            cid = rk[0]
-            if cid == chain_a:
-                res_to_batch.append(0)
+        for attempt in range(max_retries):
+            key = self._keys[idx]
+            with self._env.begin() as txn:
+                byte_data = txn.get(key)
+                data_dict = pickle.loads(byte_data)
+                
+            # 1. 提取基础数组
+            pos = torch.from_numpy(data_dict['pos']).float()
+            z = torch.from_numpy(data_dict['z']).long()
+            residue_index = torch.from_numpy(data_dict['residue_index']).long()
+            res_keys = data_dict['residue_keys']
+            meta = data_dict['meta']
+            chain_a, chain_b = meta['chains']
+            
+            # 2. 确定 is_ligand
+            res_to_batch = []
+            for rk in res_keys:
+                cid = rk[0]
+                if cid == chain_a:
+                    res_to_batch.append(0)
+                else:
+                    res_to_batch.append(1)
+            
+            res_to_batch_tensor = torch.tensor(res_to_batch, dtype=torch.long)
+            is_ligand = res_to_batch_tensor[residue_index]
+            
+            # 3. 界面掩码 (Mask Interface)
+            mask_interface = torch.zeros(pos.size(0), dtype=torch.float)
+            mask_a = (is_ligand == 0)
+            mask_b = (is_ligand == 1)
+            
+            is_valid_sample = True
+            if mask_a.any() and mask_b.any():
+                pos_a = pos[mask_a]
+                pos_b = pos[mask_b]
+                
+                dist_mat = torch.cdist(pos_a, pos_b)
+                min_dist_a, _ = dist_mat.min(dim=1)
+                min_dist_b, _ = dist_mat.min(dim=0)
+                
+                interface_a = (min_dist_a < 4.0).float()
+                interface_b = (min_dist_b < 4.0).float()
+                
+                # 判断是不是奇葩样本（例如距离过远）
+                if interface_a.sum() == 0 or interface_b.sum() == 0:
+                    is_valid_sample = False
+                else:
+                    mask_interface[mask_a] = interface_a
+                    mask_interface[mask_b] = interface_b
             else:
-                res_to_batch.append(1)
-        
-        res_to_batch_tensor = torch.tensor(res_to_batch, dtype=torch.long)
-        is_ligand = res_to_batch_tensor[residue_index]
-        
-        # 3. 界面掩码 (Mask Interface)
-        mask_interface = torch.zeros(pos.size(0), dtype=torch.float)
-        
-        mask_a = (is_ligand == 0)
-        mask_b = (is_ligand == 1)
-        
-        if mask_a.any() and mask_b.any():
-            pos_a = pos[mask_a]
-            pos_b = pos[mask_b]
-            
-            dist_mat = torch.cdist(pos_a, pos_b)
-            min_dist_a, _ = dist_mat.min(dim=1)
-            min_dist_b, _ = dist_mat.min(dim=0)
-            
-            interface_a = (min_dist_a < 4.0).float()
-            interface_b = (min_dist_b < 4.0).float()
-            
-            mask_interface[mask_a] = interface_a
-            mask_interface[mask_b] = interface_b
-        
-        # 4. Dynamic Patch Sampling（在数据增强之前）
+                is_valid_sample = False  # 残缺 PDB
+                
+            if is_valid_sample:
+                break  # 抽到了好数据，直接打破循环！
+            else:
+                if attempt < max_retries - 1:
+                    # 如果还没耗尽重试次数，重新随机抽卡
+                    idx = random.randint(0, len(self._keys) - 1)
+
+        # Codex 建议 2：重试耗尽（或验证集不重试）时，打印详细的追溯日志
+        if not is_valid_sample:
+            pdb_id = meta.get('pdb_id', 'unknown')
+            print(f"\n[WARNING] 触发异常数据兜底机制 | Split: {self.split} | PDB: {pdb_id} | Key: {key.decode('utf-8')} | Attempt: {attempt+1}/{max_retries}")
+        # ===============================================================
+
+        # 4. Dynamic Patch Sampling
         is_patched = False
         patch_index = 0
         original_num_nodes = pos.size(0)
         
+        # 即使是坏数据（验证集，或者训练集连抽 10 次黑底），底层的工程防线也能保证此函数不崩
         pos, z, residue_index, is_ligand, mask_interface, is_patched, patch_index = self._dynamic_patch_sampling(
             key, pos, z, residue_index, is_ligand, mask_interface
         )
 
-        # =========== ✅ 核心修复：坐标去中心化 ===========
-        # 这一步能救你的 Loss = NaN
+        # =========== 核心修复：坐标去中心化 ===========
         if pos.shape[0] > 0:
             pos_center = pos.mean(dim=0, keepdim=True)
             pos = pos - pos_center
-        # ===============================================
-        
+        # ============================================
         # 5. 数据增强 (随机旋转) - 在Patch Sampling之后
         if self.split == 'train' and self.random_rotation:
             rot_mat = get_random_rotation_matrix()

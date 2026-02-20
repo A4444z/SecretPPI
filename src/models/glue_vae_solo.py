@@ -300,32 +300,32 @@ class GlueVAE(nn.Module):
         self,
         z_latent,
         z_atom,
-        vector_features,
+        fake_vector_features, # 👈 接收假的向量
         edge_index,
-        edge_attr,
-        pos,
+        fake_edge_attr,       # 👈 接收假的距离
+        fake_pos,             # 👈 接收假的起点坐标
         residue_index
     ):
         """
-        解码过程：潜在向量 -&gt; 坐标。
+        解码过程：潜在向量 -> 坐标。
         """
-        # 潜在 -&gt; 残基特征
+        # 潜在 -> 残基特征
         res_features = self.latent_decoder(z_latent)
         
-        # Unpooling：残基特征 -&gt; 原子特征
+        # Unpooling：残基特征 -> 原子特征
         atom_latent = self.residue_unpooling(res_features, residue_index)
         
-        # 通过解码器
+        # 通过解码器 (此时 Decoder 只能看到瞎猜的 fake_pos 和 fake 特征)
         delta_pos = self.decoder(
-            atom_latent, z_atom, vector_features,
-            edge_index, edge_attr, pos, residue_index
+            atom_latent, z_atom, fake_vector_features,
+            edge_index, fake_edge_attr, fake_pos, residue_index
         )
         
-        # 更新坐标
-        pos_pred = pos + delta_pos
+        # 🚨 终极修复：必须是在 fake_pos 的基础上进行偏移！绝不能加上真实的 pos！
+        pos_pred = fake_pos + delta_pos
         
         return pos_pred
-        
+
     def forward(
         self,
         z,
@@ -335,40 +335,42 @@ class GlueVAE(nn.Module):
         pos,
         residue_index
     ):
-        """
-        完整前向传播。
-        
-        参数:
-            z: [N] 原子序数
-            vector_features: [N, 3] 初始向量特征
-            edge_index: [2, E] 边索引
-            edge_attr: [E, edge_dim] 边特征
-            pos: [N, 3] 真实坐标
-            residue_index: [N] 残基索引
-            
-        返回:
-            (pos_pred, mu, logvar)
-        """
-        # 编码
+        # 1. 编码 (这里没有泄露，Encoder 需要看真实数据提取信息)
         mu, logvar = self.encode(
             z, vector_features, edge_index, edge_attr, pos, residue_index
         )
-        
-        # ===== [DEBUG ASSERT] =====
-        if not torch.isfinite(mu).all():
-            raise RuntimeError("mu contains NaN/Inf right after encode()")
-        if not torch.isfinite(logvar).all():
-            raise RuntimeError("logvar contains NaN/Inf right after encode()")
-        # ==========================
-
-        # 重参数化采样
         z_latent = self.reparameterize(mu, logvar)
         
-        # 解码：在这个简单版本中，我们在同一空间预测
-        # 更高级的版本会固定受体，只生成配体
+        # ================= 🚨 斩断泄露：创建生成起点 =================
+        # 我们给 Decoder 一个完全瞎猜的起点，比如原点附近的随机高斯噪声
+        # 这样它就丧失了真实坐标的信息
+        fake_pos = torch.randn_like(pos) * 5.0  # 乘以 5.0 埃放大噪声，模拟未折叠状态
+        
+        # ⚠️ 关键难点：既然坐标变了，PaiNN 依赖的距离(edge_attr)和方向(vector_features)也必须重算！
+        # 否则如果你把 fake_pos 加上真实的 edge_attr 传进去，依然会泄露真实的距离答案！
+        
+        row, col = edge_index
+        fake_diff = fake_pos[row] - fake_pos[col]
+        fake_dist = torch.norm(fake_diff, p=2, dim=-1)
+        
+        # --- [这里需要你补充你的 RBF 和特征计算代码] ---
+        # 你必须把 dataset.py 里计算 rbf 和 vector_features 的逻辑搬到这里！
+        # 伪代码示例：
+        # fake_rbf_feat = self.rbf(fake_dist)
+        # fake_edge_attr = torch.cat([edge_type, fake_rbf_feat], dim=-1) # edge_type 可以保留真实的(如是否共价键)
+        # fake_vector_features = fake_diff / (fake_dist.unsqueeze(-1) + 1e-6)
+        # ----------------------------------------------
+        
+        # 为了让你能“立刻跑通并看到 Loss 恢复正常”，如果你还没写好重算特征的函数，
+        # 可以先用极端的暴力切断法（不推荐长期使用，但能打破 0 的僵局）：
+        fake_vector_features = torch.zeros_like(vector_features)
+        fake_edge_attr = torch.zeros_like(edge_attr)
+        # ==============================================================
+
+        # 解码：强迫 Decoder 在“一无所知”的恶劣环境下，仅靠 z_latent 还原 3D 结构
         pos_pred = self.decode(
-            z_latent, z, vector_features,
-            edge_index, edge_attr, pos, residue_index
+            z_latent, z, fake_vector_features,
+            edge_index, fake_edge_attr, fake_pos, residue_index
         )
         
         return pos_pred, mu, logvar

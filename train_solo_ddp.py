@@ -21,6 +21,7 @@ from tqdm import tqdm
 from src.models.glue_vae_solo import GlueVAE
 from src.utils.loss_solo import VAELoss, BetaScheduler
 from src.data.dataset import GlueVAEDataset
+from datetime import timedelta
 
 
 def set_seed(seed=42):
@@ -286,7 +287,10 @@ def main():
     args = parser.parse_args()
     
     # DDP 初始化
-    dist.init_process_group(backend='nccl')
+    dist.init_process_group(
+        backend='nccl',
+        timeout=timedelta(hours=10)
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ['LOCAL_RANK'])
@@ -312,6 +316,9 @@ def main():
     if rank == 0:
         print("Loading dataset...")
     
+    # if rank != 0:# 🔴 注意！这里必须 barrier 等待 rank 0 加载完成，否则会存8个缓存文件
+    #     dist.barrier()
+
     if args.overfit_test:
         if rank == 0:
             print("!!! RUNNING IN OVERFIT TEST MODE !!!")
@@ -328,59 +335,108 @@ def main():
         val_dataset = full_dataset
         if rank == 0:
             print(f"Overfit test: Using {len(train_dataset)} samples for both train and val")
-        else:
-            val_aug = aug_config.get('val', {})
-            val_use_rotation = val_aug.get('random_rotation', False)
+            
+    else:  # 🔴 注意！这个 else 必须和最外层的 if args.overfit_test: 对齐！
+        val_aug = aug_config.get('val', {})
+        val_use_rotation = val_aug.get('random_rotation', False)
+        
+        # 安全读取 max_samples 传给 Dataset
+        current_max_samples = config['data'].get('max_samples', None)
 
+        # ================= 🚨 终极防线：绝对串行化构建数据集 =================
+        # 第一阶段：Rank 0 独占执行，其他卡在后面的 barrier 罚站
+        if rank == 0:
+            print("Rank 0: 开始构建 PyG 元文件与 LMDB 缓存...")
             train_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
                 lmdb_path=config['data']['lmdb_path'],
                 split='train',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
-                random_rotation=use_rotation
+                random_rotation=use_rotation,
+                max_samples=current_max_samples
             )
-
             val_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
                 lmdb_path=config['data']['lmdb_path'],
                 split='val',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
-                random_rotation=val_use_rotation
+                random_rotation=val_use_rotation,
+                max_samples=current_max_samples
             )
+            # 强行触发所有的扫库、写缓存动作
+            total_len = len(train_full_dataset)
+            _ = len(val_full_dataset)
+            print("Rank 0: 缓存构建完毕！")
 
+        # 【路障 1】Rank 1-7 之前一直在这里等。现在 Rank 0 到了，所有人一起放行。
+        # (采纳 Codex 建议，加入 device_ids 消除 NCCL 警告)
+        dist.barrier(device_ids=[local_rank])
+
+        # 第二阶段：Rank 1-7 安全读取
+        if rank != 0:
+            import time
+            print(f"Rank {rank}: 正在等待 NFS 同步 (10秒)...")
+            time.sleep(10) # 给超算网络一点时间同步文件
+            
+            # 此时 PyG 的 processed 文件和我们自己的 pkl 都稳稳地在硬盘上了
+            train_full_dataset = GlueVAEDataset(
+                root=config['data']['root_dir'],
+                lmdb_path=config['data']['lmdb_path'],
+                split='train',
+                exclude_pdb_json=config['data'].get('exclude_pdb_json'),
+                random_rotation=use_rotation,
+                max_samples=current_max_samples
+            )
+            val_full_dataset = GlueVAEDataset(
+                root=config['data']['root_dir'],
+                lmdb_path=config['data']['lmdb_path'],
+                split='val',
+                exclude_pdb_json=config['data'].get('exclude_pdb_json'),
+                random_rotation=val_use_rotation,
+                max_samples=current_max_samples
+            )
             total_len = len(train_full_dataset)
 
-            if total_len == 1:
-                train_dataset = train_full_dataset
-                val_dataset = val_full_dataset
-                if rank == 0:
-                    print("Warning: Only one sample in dataset, using it for both train and validation")
-            else:
-                train_len = max(1, int(total_len * config['data']['train_split']))
-                val_len = max(1, total_len - train_len)
+        # 【路障 2】Rank 0 刚才瞬间就到了这里，等 Rank 1-7 读完数据后，大家再一起往下走。
+        dist.barrier(device_ids=[local_rank])
+        # =======================================================================
 
-                if train_len + val_len > total_len:
-                    train_len = total_len // 2
-                    val_len = total_len - train_len
-
-                indices = torch.randperm(
-                    total_len,
-                    generator=torch.Generator().manual_seed(args.seed)
-                ).tolist()
-
-                train_indices = indices[:train_len]
-                val_indices = indices[train_len:train_len + val_len]
-
-                train_dataset = Subset(train_full_dataset, train_indices)
-                val_dataset = Subset(val_full_dataset, val_indices)
-
+        if total_len == 1:
+            train_dataset = train_full_dataset
+            val_dataset = val_full_dataset
             if rank == 0:
-                print(f"Total dataset size: {total_len}")
-                print(f"Train dataset size: {len(train_dataset)}")
-                print(f"Val dataset size: {len(val_dataset)}")
+                print("Warning: Only one sample in dataset, using it for both train and validation")
+        else:
+            train_len = max(1, int(total_len * config['data']['train_split']))
+            val_len = max(1, total_len - train_len)
 
-        
+            if train_len + val_len > total_len:
+                train_len = total_len // 2
+                val_len = total_len - train_len
+
+            indices = torch.randperm(
+                total_len,
+                generator=torch.Generator().manual_seed(args.seed)
+            ).tolist()
+
+            train_indices = indices[:train_len]
+            val_indices = indices[train_len:train_len + val_len]
+
+            train_dataset = Subset(train_full_dataset, train_indices)
+            val_dataset = Subset(val_full_dataset, val_indices)
+
+        if rank == 0:
+            print(f"Total dataset size: {total_len}")
+            print(f"Train dataset size: {len(train_dataset)}")
+            print(f"Val dataset size: {len(val_dataset)}")
+
+        # 🔴 新增这行：强行触发 val_full_dataset 的 _load_keys()，
+            # 让 Rank 0 顺手把 keys_cache_val.pkl 也给生成了！
+            # _ = len(val_full_dataset)
     
+    # if rank == 0:#第二次调取barrier，启动其他7个进程
+    #     dist.barrier()
+
     train_sampler = DistributedSampler(
         train_dataset,
         num_replicas=world_size,
@@ -426,8 +482,9 @@ def main():
         use_gradient_checkpointing=config['model']['use_gradient_checkpointing']
     ).to(device)
     
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    
+    # ✅ 修改为：告诉 DDP，如果发现有参数没用到，不要报错，直接忽略它们！
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+
     if rank == 0:
         num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params:,}")
