@@ -22,6 +22,7 @@ from src.models.glue_vae_solo import GlueVAE
 from src.utils.loss_solo import VAELoss, BetaScheduler
 from src.data.dataset import GlueVAEDataset
 from datetime import timedelta
+import datetime
 
 
 def set_seed(seed=42):
@@ -104,7 +105,9 @@ def train_epoch(
             edge_index=batch.edge_index,
             edge_attr=batch.edge_attr,
             pos=batch.pos,
-            residue_index=batch.residue_index
+            residue_index=batch.residue_index,
+            mask_interface=batch.mask_interface,  # 👈 新增：把界面掩码传给模型
+            batch_idx=batch.batch                 # 👈 新增：必须传 batch 索引
         )
         
         if rank == 0 and epoch == 0 and batch_idx == 0:
@@ -212,7 +215,9 @@ def validate(
             edge_index=batch.edge_index,
             edge_attr=batch.edge_attr,
             pos=batch.pos,
-            residue_index=batch.residue_index
+            residue_index=batch.residue_index,
+            mask_interface=batch.mask_interface,  # 👈 新增：把界面掩码传给模型
+            batch_idx=batch.batch                 # 👈 新增：必须传 batch 索引
         )
         
         loss, recon_loss, kl_loss = criterion(
@@ -270,11 +275,25 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
     }
     
+    # ================= 🚨 新增：时间戳和动态文件名 =================
+    # 获取当前时间，格式例如：20260220_153045
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 构造带有时间戳和 epoch 的文件名
+    filename = f"checkpoint_{timestamp}_epoch_{epoch}.pt"
+    save_path = os.path.join(save_dir, filename)
+    
+    # 保存带有时间戳的实体文件
+    torch.save(checkpoint, save_path)
+    # ==============================================================
+    
+    # 顺手保存一个 `checkpoint_latest.pt`
+    # 这样做的好处是：你下次写启动脚本时，--resume 参数永远可以直接指向这个 latest 文件，不用每次都去抄长长的带时间戳的名字
     latest_path = os.path.join(save_dir, 'checkpoint_latest.pt')
     torch.save(checkpoint, latest_path)
     
     if is_best:
-        best_path = os.path.join(save_dir, 'checkpoint_best.pt')
+        best_path = os.path.join(save_dir, f'checkpoint_best.pt')
         torch.save(checkpoint, best_path)
 
 
@@ -526,17 +545,27 @@ def main():
     global_step = 0
     best_val_loss = float('inf')
     
-    if args.resume is not None and rank == 0:
-        print(f"Resuming from checkpoint: {args.resume}")
+    # ================= 🚨 修复 DDP 断点加载 Bug =================
+    # 去掉了 `and rank == 0`，保证 8 张卡同时同步加载权重！
+    if args.resume is not None:
+        if rank == 0:
+            print(f"Resuming from checkpoint: {args.resume}")
+        
+        # map_location=device 确保每张卡只把权重读到自己的专属显存里，不会爆内存
         checkpoint = torch.load(args.resume, map_location=device)
+        
         if isinstance(model, DDP):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
+            
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         global_step = checkpoint['step']
-        print(f"Resumed at epoch {start_epoch}, step {global_step}")
+        
+        if rank == 0:
+            print(f"✅ Resumed at epoch {start_epoch}, step {global_step}")
+    # ==========================================================
     
     if rank == 0:
         print("Starting training...")

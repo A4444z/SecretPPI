@@ -27,14 +27,14 @@ model:
 # 训练配置
 training:
   num_epochs: 100
-  learning_rate: 5.0e-4
+  learning_rate: 1.0e-4
   weight_decay: 1.0e-6
-  max_grad_norm: 10.0
+  max_grad_norm: 5.0
   
   # KL 散度退火配置
   beta:
     start: 0.0
-    end: 1.0
+    end: 0.1
     warmup_steps: 10000
     schedule_type: "linear"  # linear, cyclic, step
   
@@ -57,7 +57,7 @@ logging:
   entity: null
   log_interval: 100
   val_interval: 5
-  save_interval: 10
+  save_interval: 4
   save_dir: "checkpoints"
   use_wandb: true  # 设置为 true 启用 wandb
 

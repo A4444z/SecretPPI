@@ -19,18 +19,14 @@ from torch_geometric.utils import to_dense_batch
 
 class DRMSDLoss(nn.Module):
     """
-    D-RMSD 损失函数。
-    计算预测坐标和真实坐标的成对距离矩阵之间的均方误差。
-    
-    优势：
-    - SE(3) 不变：旋转/平移输入不影响损失值
-    - 无需对齐：不需要 Kabsch 算法
-    - 支持批量图处理
+    D-RMSD 损失函数 (带局部截断)。
+    只计算预测坐标和真实坐标在局部邻域内的成对距离误差。
     """
     
-    def __init__(self, reduction='mean'):
+    def __init__(self, reduction='mean', cutoff=15.0):
         super().__init__()
         self.reduction = reduction
+        self.cutoff = cutoff  # 🚨 新增：截断距离，建议 10.0 ~ 15.0 埃
         
     def forward(
         self,
@@ -39,15 +35,6 @@ class DRMSDLoss(nn.Module):
         mask=None,
         batch_idx=None
     ):
-        """
-        参数:
-            pos_pred: [N, 3] 预测的原子坐标
-            pos_true: [N, 3] 真实的原子坐标
-            mask: [N] 可选的原子掩码，1表示有效
-            batch_idx: [N] PyG 批量索引，区分不同图
-        返回:
-            D-RMSD 损失标量
-        """
         if batch_idx is None:
             batch_idx = torch.zeros(pos_pred.size(0), dtype=torch.long, device=pos_pred.device)
         
@@ -61,50 +48,50 @@ class DRMSDLoss(nn.Module):
         
         mse = (D_pred - D_true) ** 2
         
-        # 有效节点掩码 (去除 padding 的虚拟节点)
+        # 1. 有效节点掩码 (去除 padding 的虚拟节点)
         valid_2d = batch_mask.unsqueeze(1) * batch_mask.unsqueeze(2)
+        
+        # ================= 🚨 核心修复：引入局部距离截断 =================
+        # 只惩罚真实距离在 cutoff 之内的原子对！释放全局结构的自由度。
+        cutoff_mask = (D_true < self.cutoff).float()
+        
+        # 去除对角线（原子自己到自己的距离为0，不算作有效误差避免拉低 mean）
+        eye_mask = 1.0 - torch.eye(D_true.size(1), device=D_true.device).unsqueeze(0)
+        
+        # 组合成最终的基础 mask
+        base_mask = valid_2d * cutoff_mask * eye_mask
+        # ===============================================================
         
         if mask is not None:
             mask_dense, _ = to_dense_batch(mask, batch_idx)
             mask_2d = mask_dense.unsqueeze(1) * mask_dense.unsqueeze(2)
-            final_mask = mask_2d * valid_2d
+            final_mask = mask_2d * base_mask
         else:
-            final_mask = valid_2d
+            final_mask = base_mask
         
         mse = mse * final_mask
         
         if self.reduction == 'mean':
+            # 分母使用实际参与计算的有效 Pair 数量
             return mse.sum() / (final_mask.sum() + 1e-8)
         return mse.sum()
 
 
 class KLLoss(nn.Module):
     """
-    KL 散度损失。
-    计算标准正态分布和学习到的高斯分布之间的 KL 散度。
-    
-    KL(q(z|x) || p(z)) = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    真实的 KL 散度计算（用于真实日志记录）。
     """
-    
-    def __init__(self, reduction='mean'):
+    def __init__(self, reduction='batchmean'):
         super().__init__()
         self.reduction = reduction
         
-    def forward(
-        self,
-        mu,
-        logvar
-    ):
-        """
-        参数:
-            mu: [*, latent_dim] 均值
-            logvar: [*, latent_dim] 对数方差
-        返回:
-            KL 散度
-        """
+    def forward(self, mu, logvar):
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
         
-        if self.reduction == 'mean':
+        if self.reduction == 'batchmean':
+            # 真实、未稀释的总 KL 散度
+            return kl.sum(dim=-1).mean()
+        elif self.reduction == 'mean':
             return kl.mean()
         elif self.reduction == 'sum':
             return kl.sum()
@@ -180,19 +167,19 @@ class BetaScheduler:
 class VAELoss(nn.Module):
     """
     完整的 VAE 损失函数。
-    组合 D-RMSD 重建损失和 KL 散度正则化。
-    
-    Loss = recon_loss + beta * kl_loss
+    组合 D-RMSD 重建损失和带 Free Bits 的 KL 散度正则化。
     """
     
     def __init__(
         self,
-        beta=1.0,
+        beta=0.1,
         recon_reduction='mean',
-        kl_reduction='mean'
+        kl_reduction='batchmean',
+        free_bits=2.0  # 🚨 在这里引入 free_bits
     ):
         super().__init__()
         self.beta = beta
+        self.free_bits = free_bits
         self.drmsd_loss = DRMSDLoss(reduction=recon_reduction)
         self.kl_loss = KLLoss(reduction=kl_reduction)
         
@@ -205,22 +192,21 @@ class VAELoss(nn.Module):
         mask=None,
         batch_idx=None
     ):
-        """
-        参数:
-            pos_pred: [N, 3] 预测坐标
-            pos_true: [N, 3] 真实坐标
-            mu: [latent_dim] 或 [N, latent_dim] 潜在空间均值
-            logvar: [latent_dim] 或 [N, latent_dim] 潜在空间对数方差
-            mask: [N] 可选的原子掩码
-            batch_idx: [N] PyG 批量索引
-        返回:
-            (total_loss, recon_loss, kl_loss)
-        """
+        # 1. 计算重构误差
         recon_loss = self.drmsd_loss(pos_pred, pos_true, mask, batch_idx)
-        kl_loss = self.kl_loss(mu, logvar)
-        total_loss = recon_loss + self.beta * kl_loss
         
-        return total_loss, recon_loss, kl_loss
+        # 2. 计算真实的 KL 散度（用于在 WandB 上透明监控！）
+        raw_kl = self.kl_loss(mu, logvar)
+        
+        # 3. 🚨 核心魔法：计算用于反向传播的截断 KL (Hinge Loss)
+        # 优化器只会看到这个 clamped_kl，所以低于 free_bits 时没有梯度
+        clamped_kl = torch.clamp(raw_kl - self.free_bits, min=0.0)
+        
+        # 4. 组装总 Loss（给模型优化的真正目标）
+        total_loss = recon_loss + self.beta * clamped_kl
+        
+        # 🚨 注意看返回值：我们返回 total_loss 给优化器，但返回 raw_kl 给 WandB！
+        return total_loss, recon_loss, raw_kl
 
 
 class CoordinateDecoder(nn.Module):

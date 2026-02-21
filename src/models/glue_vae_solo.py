@@ -18,6 +18,22 @@ from torch_scatter import scatter_mean, scatter_sum
 from src.models.layers_solo import PaiNNEncoder
 from src.utils.loss_solo import CoordinateDecoder
 
+# ================= 🚨 新增 RBF 类 =================
+class GaussianSmearing(nn.Module):
+    """
+    径向基函数 (RBF) 展开，用于将标量距离映射为高维向量。
+    """
+    def __init__(self, start=0.0, stop=10.0, num_gaussians=16):
+        super().__init__()
+        offset = torch.linspace(start, stop, num_gaussians)
+        # 计算高斯函数的宽度系数
+        self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
+        self.register_buffer('offset', offset)
+
+    def forward(self, dist):
+        dist = dist.view(-1, 1) - self.offset.view(1, -1)
+        return torch.exp(self.coeff * torch.pow(dist, 2))
+# ===================================================
 
 class ResiduePooling(nn.Module):
     """
@@ -153,7 +169,8 @@ class ConditionalPaiNNDecoder(nn.Module):
         )
         
         # 坐标预测头
-        self.coord_decoder = CoordinateDecoder(hidden_dim, num_layers=2)
+        #self.coord_decoder = CoordinateDecoder(hidden_dim, num_layers=2)
+        self.v_proj = nn.Linear(hidden_dim, 1, bias=False)
         
     def forward(
         self,
@@ -184,7 +201,14 @@ class ConditionalPaiNNDecoder(nn.Module):
         s, v = self.painn(z_atom, vector_features, edge_index, edge_attr, pos, initial_s=s_initial)
         
         # 预测坐标偏移
-        delta_pos = self.coord_decoder(s)
+        #delta_pos = self.coord_decoder(s)
+        # 它的作用是把 [N, 3, hidden_dim] 的向量特征压缩成 [N, 3, 1] 的物理位移
+        #self.v_proj = nn.Linear(hidden_dim, 1, bias=False)
+
+        # ✅ 完美修复：将 [N, 128, 3] 转置为 [N, 3, 128]
+        # 这样线性层就会对 128 进行计算，输出 [N, 3, 1]
+        # 最后 squeeze(-1) 挤掉最后那个 1，留下完美的 [N, 3] 坐标偏移！
+        delta_pos = self.v_proj(v.transpose(1, 2)).squeeze(-1)
         
         return delta_pos
 
@@ -236,6 +260,15 @@ class GlueVAE(nn.Module):
             vocab_size=vocab_size,
             use_gradient_checkpointing=use_gradient_checkpointing
         )
+
+        # ================= 🚨 新增 RBF 层 =================
+        # edge_dim (19) - 拓扑特征 (3) = 16 维的高斯特征
+        self.rbf = GaussianSmearing(
+            start=0.0, 
+            stop=10.0, 
+            num_gaussians=edge_dim - 3
+        )
+        # ==================================================
         
     def reparameterize(self, mu, logvar):
         """
@@ -333,43 +366,73 @@ class GlueVAE(nn.Module):
         edge_index,
         edge_attr,
         pos,
-        residue_index
+        residue_index,
+        mask_interface=None,  # 👈 新增
+        batch_idx=None        # 👈 新增：必须有这个才能区分不同的复合物
     ):
-        # 1. 编码 (这里没有泄露，Encoder 需要看真实数据提取信息)
         mu, logvar = self.encode(
             z, vector_features, edge_index, edge_attr, pos, residue_index
         )
         z_latent = self.reparameterize(mu, logvar)
         
-        # ================= 🚨 斩断泄露：创建生成起点 =================
-        # 我们给 Decoder 一个完全瞎猜的起点，比如原点附近的随机高斯噪声
-        # 这样它就丧失了真实坐标的信息
-        fake_pos = torch.randn_like(pos) * 5.0  # 乘以 5.0 埃放大噪声，模拟未折叠状态
+        noise_scale = 4.0 
+        fake_pos = pos + torch.randn_like(pos) * noise_scale
         
-        # ⚠️ 关键难点：既然坐标变了，PaiNN 依赖的距离(edge_attr)和方向(vector_features)也必须重算！
-        # 否则如果你把 fake_pos 加上真实的 edge_attr 传进去，依然会泄露真实的距离答案！
+        # ================= 🚨 终极杀招：PyG Batched Interface Block Masking =================
+        if self.training and mask_interface is not None and batch_idx is not None:
+            # 创建一个全图的空 Mask
+            block_mask = torch.zeros(pos.size(0), dtype=torch.bool, device=pos.device)
+            
+            # 获取 Batch 中总共有多少个独立的图 (比如 16 个)
+            num_graphs = int(batch_idx.max().item()) + 1
+            
+            # 对每一个图执行独立的界面轰炸
+            for i in range(num_graphs):
+                # 找到属于第 i 个图的所有原子的全局索引
+                graph_node_idx = torch.nonzero(batch_idx == i).squeeze(-1)
+                
+                # 提取这个图的界面掩码
+                graph_interface_mask = mask_interface[graph_node_idx]
+                graph_interface_nodes = graph_node_idx[torch.nonzero(graph_interface_mask).squeeze(-1)]
+                
+                # 如果这个图有界面原子
+                if graph_interface_nodes.numel() > 0:
+                    # 1. 随机选一个爆炸中心
+                    center_idx = graph_interface_nodes[torch.randint(0, graph_interface_nodes.numel(), (1,))]
+                    center_pos = pos[center_idx]
+                    
+                    # 2. 算这个图里所有原子到中心的距离
+                    dist_to_center = torch.norm(pos[graph_node_idx] - center_pos, p=2, dim=-1)
+                    
+                    # 3. 找出局部 10 埃内的原子
+                    local_block_mask = dist_to_center < 10.0
+                    
+                    # 4. 把被炸的原子映射回全局的 block_mask 里
+                    global_block_mask_idx = graph_node_idx[local_block_mask]
+                    block_mask[global_block_mask_idx] = True
+            
+            # 统计总共被掩码的原子
+            num_masked = block_mask.sum()
+            if num_masked > 0:
+                # 塌陷到各自原子的质心（这里做了简化处理，塌陷到原点附近并施加扰动，彻底破坏其空间结构）
+                independent_noise = torch.randn((num_masked, 3), device=pos.device) * 0.1
+                fake_pos[block_mask] = independent_noise
+        # =========================================================================
+            
+        edge_type = edge_attr[:, :3]
         
+        # 重新计算距离 (防崩溃的 Safe Norm)
         row, col = edge_index
         fake_diff = fake_pos[row] - fake_pos[col]
-        fake_dist = torch.norm(fake_diff, p=2, dim=-1)
+        dist_sq = (fake_diff ** 2).sum(dim=-1)
+        fake_dist = torch.sqrt(dist_sq + 1e-8) 
         
-        # --- [这里需要你补充你的 RBF 和特征计算代码] ---
-        # 你必须把 dataset.py 里计算 rbf 和 vector_features 的逻辑搬到这里！
-        # 伪代码示例：
-        # fake_rbf_feat = self.rbf(fake_dist)
-        # fake_edge_attr = torch.cat([edge_type, fake_rbf_feat], dim=-1) # edge_type 可以保留真实的(如是否共价键)
-        # fake_vector_features = fake_diff / (fake_dist.unsqueeze(-1) + 1e-6)
-        # ----------------------------------------------
-        
-        # 为了让你能“立刻跑通并看到 Loss 恢复正常”，如果你还没写好重算特征的函数，
-        # 可以先用极端的暴力切断法（不推荐长期使用，但能打破 0 的僵局）：
+        fake_rbf_feat = self.rbf(fake_dist)
+        fake_edge_attr = torch.cat([edge_type, fake_rbf_feat], dim=-1)
         fake_vector_features = torch.zeros_like(vector_features)
-        fake_edge_attr = torch.zeros_like(edge_attr)
-        # ==============================================================
 
-        # 解码：强迫 Decoder 在“一无所知”的恶劣环境下，仅靠 z_latent 还原 3D 结构
         pos_pred = self.decode(
-            z_latent, z, fake_vector_features,
+            z_latent, z, fake_vector_features, 
             edge_index, fake_edge_attr, fake_pos, residue_index
         )
         
@@ -384,7 +447,9 @@ class GlueVAE(nn.Module):
         edge_attr,
         pos,
         residue_index,
-        num_samples=1
+        num_samples=1,
+        mask_interface=None,  # 👈 新增
+        batch_idx=None        # 👈 新增：必须有这个才能区分不同的复合物
     ):
         """
         从潜在空间采样生成多个样本。
@@ -396,11 +461,28 @@ class GlueVAE(nn.Module):
         samples = []
         for _ in range(num_samples):
             z_latent = self.reparameterize(mu, logvar)
+            
+            # ================= 🚨 修复 sample 方法的数据泄露与维度 =================
+            # 🚨 拯救图神经网络的命脉：在真实坐标上施加小幅度扰动，而不是完全抹杀
+            noise_scale = 4.0 
+            fake_pos = pos + torch.randn_like(pos) * noise_scale  
+            edge_type = edge_attr[:, :3]            
+            
+            row, col = edge_index
+            fake_diff = fake_pos[row] - fake_pos[col]
+            fake_dist = torch.norm(fake_diff, p=2, dim=-1) + 1e-6 
+            
+            fake_rbf_feat = self.rbf(fake_dist)
+            fake_edge_attr = torch.cat([edge_type, fake_rbf_feat], dim=-1)
+            
+            # 节点级别初始向量，同样用全零
+            fake_vector_features = torch.zeros_like(vector_features)
+            # ===============================================================
+            # 使用重算后的 fake 特征进行解码
             pos_pred = self.decode(
-                z_latent, z, vector_features,
-                edge_index, edge_attr, pos, residue_index
+                z_latent, z, fake_vector_features,
+                edge_index, fake_edge_attr, fake_pos, residue_index
             )
             samples.append(pos_pred)
             
         return torch.stack(samples, dim=0)
-
