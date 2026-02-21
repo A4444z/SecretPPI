@@ -9,7 +9,7 @@ data:
   train_split: 0.9
   val_split: 0.05
   test_split: 0.05
-  batch_size: 16       # 注意：如果是 8 卡 DDP，真实 Batch Size = 16 * 8 = 128，这对对比学习非常完美！
+  batch_size: 32       # 注意：如果是 8 卡 DDP，真实 Batch Size = 16 * 8 = 128，这对对比学习非常完美！
   num_workers: 4
   pin_memory: false
 

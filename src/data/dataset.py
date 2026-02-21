@@ -78,6 +78,9 @@ class GlueVAEDataset(Dataset):
         
         # 用于维护每个样本的采样状态
         self._sample_states = {}
+
+        # 🚨 必须在这里把参数赋值给 self！
+        self.cutoff_radius = cutoff_radius
         
         # 几何计算工具：高斯径向基函数 (RBF)
         self.rbf = GaussianRBF(n_rbf=16, cutoff=self.cutoff_radius, start=0.0)
