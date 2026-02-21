@@ -1,0 +1,76 @@
+# GlueCMAE 配置文件
+# 所有超参数设置
+
+# 数据配置
+data:
+  root_dir: "./"
+  lmdb_path: "database/3DComplex/processed_lmdb"
+  exclude_pdb_json: "database/CASF-2016_pdb_ids.json"
+  train_split: 0.9
+  val_split: 0.05
+  test_split: 0.05
+  batch_size: 16       # 注意：如果是 8 卡 DDP，真实 Batch Size = 16 * 8 = 128，这对对比学习非常完美！
+  num_workers: 4
+  pin_memory: false
+
+# 模型配置
+model:
+  hidden_dim: 128
+  num_encoder_layers: 6
+  num_decoder_layers: 4
+  edge_dim: 19
+  vocab_size: 101
+  use_gradient_checkpointing: true
+
+# 训练配置
+training:
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  max_grad_norm: 5.0
+  
+  # ================= 🚨 CMAE 专属超参数 =================
+  temperature: 0.1         # InfoNCE 温度系数 (建议范围: 0.07 ~ 0.2)
+  lambda_contrast: 1.0     # 对比损失权重 (主导流形拉伸)
+  lambda_recon: 0.5        # 局部重构损失权重 (辅助物理保真)
+  # =====================================================
+  
+  # 优化器配置
+  optimizer:
+    type: "Adam"
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  
+  # 学习率调度器
+  scheduler:
+    type: "ReduceLROnPlateau"
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+# 日志和保存配置
+logging:
+  project: "GlueCMAE"      # 👈 改成了 CMAE，方便在 WandB 上区分历史曲线
+  entity: null
+  log_interval: 100
+  val_interval: 5
+  save_interval: 4
+  save_dir: "checkpoints"
+  use_wandb: true
+
+# 几何配置
+geometry:
+  cutoff: 4.5
+  rbf_dim: 16
+  contact_cutoff: 4.0
+
+# SE(3) 数据增强
+augmentation:
+  train:
+    random_rotation: true
+    random_translation: false
+    translation_std: 0.1
+  val:
+    random_rotation: false
+    random_translation: false
+

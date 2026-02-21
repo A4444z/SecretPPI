@@ -35,11 +35,12 @@ class GlueVAEDataset(Dataset):
         lmdb_path: Optional[str] = None,
         max_atoms: int = 1000,
         patch_radius: float = 15.0,
-        max_num_neighbors: int = 32,
+        max_num_neighbors: int = 0,
         num_fps_points: int = 5,
         exclude_pdb_json: Optional[str] = None,
         random_rotation: bool = True,
-        max_samples: Optional[int] = None
+        max_samples: Optional[int] = None,
+        cutoff_radius: float = 8.0
     ):
         """
         参数:
@@ -48,7 +49,7 @@ class GlueVAEDataset(Dataset):
             lmdb_path: LMDB 数据库路径。如果为 None，则默认使用 root/processed_lmdb。
             max_atoms: 触发补丁采样的最大原子数，默认1000。
             patch_radius: 补丁采样的半径阈值，单位Å，默认15.0。
-            max_num_neighbors: 每个节点的最大邻居数，防止边数爆炸，默认32。
+            max_num_neighbors: 每个节点的最大邻居数，防止边数爆炸，默认0。
             num_fps_points: 使用最远点采样(FPS)生成的候选中心数量，默认5。
             exclude_pdb_json: 包含需要排除的PDB ID的JSON文件路径（如CASF-2016）。
             max_samples: 最多加载多少个样本，None 表示全部加载。
@@ -79,7 +80,7 @@ class GlueVAEDataset(Dataset):
         self._sample_states = {}
         
         # 几何计算工具：高斯径向基函数 (RBF)
-        self.rbf = GaussianRBF(n_rbf=16, cutoff=4.5, start=0.0)
+        self.rbf = GaussianRBF(n_rbf=16, cutoff=self.cutoff_radius, start=0.0)
         
         super().__init__(root, transform, pre_transform)
     
@@ -371,7 +372,7 @@ class GlueVAEDataset(Dataset):
         这样既限制了边数，又保证了物理距离，且全程 GPU/C++ 加速。
         """
         if self.max_num_neighbors <= 0:
-            return radius_graph(pos, r=4.5, loop=False)
+            return radius_graph(pos, r=self.cutoff_radius, loop=False)
         
         # 1. 先找最近的 max_num_neighbors (e.g. 32) 个邻居
         # flow='target_to_source' 是 PyG 默认的消息传递方向
@@ -382,7 +383,7 @@ class GlueVAEDataset(Dataset):
         dist = torch.norm(pos[row] - pos[col], p=2, dim=1)
         
         # 3. 再次应用半径阈值 (4.5A) 进行裁剪
-        mask = dist < 4.5
+        mask = dist < self.cutoff_radius
         edge_index = edge_index[:, mask]
         
         return edge_index
