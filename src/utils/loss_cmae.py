@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.utils import to_dense_batch
+import torch.nn.functional as F
 
 # ================= 1. 核心重构损失：Masked D-RMSD =================
 
@@ -73,47 +74,34 @@ class MaskedDRMSDLoss(nn.Module):
 
 class InfoNCELoss(nn.Module):
     """
-    InfoNCE / NT-Xent 对比损失。
-    将同一个复合物的两个视图拉近，将 Batch 内其他复合物推开。
+    InfoNCE / NT-Xent 对比损失 (数值稳定版)。
+    使用 F.cross_entropy 避免 exp/log 导致的精度溢出。
     """
     def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
     def forward(self, z1, z2):
-        """
-        参数:
-            z1: [B, D] L2 归一化后的视图1表征
-            z2: [B, D] L2 归一化后的视图2表征
-        """
-        B = z1.shape[0]
-        # 拼接成 [2B, D] 的大张量
-        z = torch.cat([z1, z2], dim=0)
+        B = z1.size(0)
+        z = torch.cat([z1, z2], dim=0)  # [2B, D]
         
-        # 计算余弦相似度矩阵 [2B, 2B] (因为 z 已经归一化，点乘就是余弦相似度)
-        sim = torch.matmul(z, z.T) / self.temperature
-
-        # 构建正样本索引
-        # 对于 z1[i]，正样本是 z2[i]，索引为 i + B
-        # 对于 z2[i]，正样本是 z1[i]，索引为 i (因为 i 本身是 i+B 减去 B)
-        positives = torch.cat([torch.arange(B, 2*B), torch.arange(0, B)], dim=0).to(z1.device)
-
-        # 提取正样本的相似度 [2B, 1]
-        pos_sim = sim[torch.arange(2*B), positives].unsqueeze(1)
-
-        # 构建 Logits 掩码，去除自身相似度 (对角线)
-        logits_mask = ~torch.eye(2*B, dtype=torch.bool, device=z.device)
+        # 计算余弦相似度矩阵并除以温度
+        logits = torch.matmul(z, z.T) / self.temperature
         
-        # 取出非自身的相似度 [2B, 2B - 1] 作为分母候选
-        logits = sim[logits_mask].view(2*B, -1)
-
-        # InfoNCE = -log( exp(pos) / sum(exp(all_except_self)) )
-        # 为了数值稳定，通常用 log_softmax 或手动平移
-        exp_logits = torch.exp(logits)
-        denom = exp_logits.sum(dim=1, keepdim=True)
-        loss = - torch.log(torch.exp(pos_sim) / denom)
+        # 🚨 屏蔽对角线 (自己和自己的相似度设为极小值)
+        mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+        logits = logits.masked_fill(mask, -1e9)
         
-        return loss.mean()
+        # 构建分类 Target：
+        # z1[i] 的正样本是 z2[i] (即索引 i + B)
+        # z2[i] 的正样本是 z1[i] (即索引 i)
+        targets = torch.cat([
+            torch.arange(B, 2 * B, device=z.device),
+            torch.arange(0, B, device=z.device)
+        ], dim=0)
+        
+        # 直接使用交叉熵，极其稳定
+        return F.cross_entropy(logits, targets)
 
 # ================= 3. 组合引擎：CMAE Loss =================
 

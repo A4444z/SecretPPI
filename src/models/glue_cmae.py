@@ -312,6 +312,11 @@ class GlueVAE(nn.Module):
         if batch_idx is None or mask_interface is None:
             raise ValueError("CMAE requires batch_idx and mask_interface.")
 
+        # ================= 🚨 核心修复：压缩残基索引 =================
+        # 将有空洞的 residue_index (如 [5,5,8,8]) 映射为连续的 ([0,0,1,1])
+        _, residue_index_compact = torch.unique(residue_index, sorted=True, return_inverse=True)
+        # ==========================================================
+
         num_graphs = int(batch_idx.max().item()) + 1
 
         # ================= 1. 构造 View 1 (Mask A) 和 View 2 (Mask B) =================
@@ -370,20 +375,21 @@ class GlueVAE(nn.Module):
         fake_edge_attr_v2 = torch.cat([edge_type, self.rbf(fake_dist_v2)], dim=-1)
 
         # ================= 3. 双路编码 (Encoder) =================
-        res_feat_v1, z_proj_v1 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v1, pos_v1, residue_index)
-        res_feat_v2, z_proj_v2 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v2, pos_v2, residue_index)
+        # 🚨 必须把压缩后的 residue_index_compact 传进去！
+        res_feat_v1, z_proj_v1 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v1, pos_v1, residue_index_compact)
+        res_feat_v2, z_proj_v2 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v2, pos_v2, residue_index_compact)
 
-        # 🚨 Graph-level Pooling: 将残基级 Z 池化为整个复合物的 Z，用于 InfoNCE
-        # 1. 算出每个残基属于哪个 Graph (复合物)
-        num_residues = z_proj_v1.shape[0]
-        res_batch = torch.zeros(num_residues, dtype=torch.long, device=pos.device)
-        res_batch.scatter_(0, residue_index, batch_idx)
+        # 🚨 核心修复：更安全地构造 res_batch
+        # 找到每个残基对应的第一个原子的索引
+        _, first_atom_indices = torch.unique(residue_index_compact, return_index=True)
+        # 通过该原子找到这个残基属于哪个 Graph
+        res_batch = batch_idx[first_atom_indices]  # [R]
 
         # 2. 将同一个 Graph 下的所有残基向量做平均
         graph_z1 = scatter_mean(z_proj_v1, res_batch, dim=0)
         graph_z2 = scatter_mean(z_proj_v2, res_batch, dim=0)
 
-        # 3. 再次 L2 归一化 (因为 mean_pool 会破坏超球面分布)
+        # 3. 再次 L2 归一化
         graph_z1 = F.normalize(graph_z1, p=2, dim=-1)
         graph_z2 = F.normalize(graph_z2, p=2, dim=-1)
 
@@ -392,8 +398,7 @@ class GlueVAE(nn.Module):
         # Decoder 必须通过隐空间，把被炸掉的受体坐标猜出来。
         pos_pred_v1 = self.decode(
             res_feat_v1, z, fake_vector_features,
-            edge_index, fake_edge_attr_v1, pos_v1, residue_index
+            edge_index, fake_edge_attr_v1, pos_v1, residue_index_compact
         )
 
-        # 🚨 必须返回 mask_v1，因为 Loss 函数只允许在这部分原子上算误差！
         return graph_z1, graph_z2, pos_pred_v1, mask_v1

@@ -287,7 +287,7 @@ def save_checkpoint(
 
 def main():
     parser = argparse.ArgumentParser(description='GlueVAE CMAE DDP Training')
-    parser.add_argument('--config', type=str, default='config_solo.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='config_cmae.yaml', help='Path to config file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--overfit_test', action='store_true', help='Enable overfit test mode')
@@ -395,29 +395,11 @@ def main():
 
         dist.barrier(device_ids=[local_rank])
 
-        if total_len == 1:
-            train_dataset = train_full_dataset
-            val_dataset = val_full_dataset
-            if rank == 0:
-                print("Warning: Only one sample in dataset, using it for both train and validation")
-        else:
-            train_len = max(1, int(total_len * config['data']['train_split']))
-            val_len = max(1, total_len - train_len)
-
-            if train_len + val_len > total_len:
-                train_len = total_len // 2
-                val_len = total_len - train_len
-
-            indices = torch.randperm(
-                total_len,
-                generator=torch.Generator().manual_seed(args.seed)
-            ).tolist()
-
-            train_indices = indices[:train_len]
-            val_indices = indices[train_len:train_len + val_len]
-
-            train_dataset = Subset(train_full_dataset, train_indices)
-            val_dataset = Subset(val_full_dataset, val_indices)
+        # 👇 -------- 把这几行粘贴进去 -------- 👇
+        # 直接使用我们在上面配置好的专门的 train 和 val 数据集，杜绝索引错位！
+        train_dataset = train_full_dataset
+        val_dataset = val_full_dataset
+        # 👆 -------- 粘贴结束 -------- 👆
 
         if rank == 0:
             print(f"Total dataset size: {total_len}")
@@ -480,12 +462,13 @@ def main():
     temp = config['training'].get('temperature', 0.1)
     l_contrast = config['training'].get('lambda_contrast', 1.0)
     l_recon = config['training'].get('lambda_recon', 0.5)
+    recon_cutoff = config['training'].get('recon_cutoff', 15.0) # 👈 新增读取
     
     criterion = CMAELoss(
         temperature=temp,
         lambda_contrast=l_contrast,
         lambda_recon=l_recon,
-        cutoff=15.0  # 建议使用截断以限制损失仅在局部
+        cutoff=recon_cutoff  # 建议使用截断以限制损失仅在局部
     )
     # =========================================================
     
