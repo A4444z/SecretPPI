@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.utils import to_dense_batch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 # ================= 1. 核心重构损失：Masked D-RMSD =================
 
@@ -73,16 +74,24 @@ class MaskedDRMSDLoss(nn.Module):
 # ================= 2. 核心对比损失：InfoNCE =================
 
 class InfoNCELoss(nn.Module):
-    """
-    InfoNCE / NT-Xent 对比损失 (数值稳定版)。
-    使用 F.cross_entropy 避免 exp/log 导致的精度溢出。
-    """
     def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
     def forward(self, z1, z2):
-        B = z1.size(0)
+        # 🚨 新增：跨 GPU 全局负样本收集 (All-Gather)
+        if dist.is_initialized():
+            z1_list = [torch.zeros_like(z1) for _ in range(dist.get_world_size())]
+            z2_list = [torch.zeros_like(z2) for _ in range(dist.get_world_size())]
+            dist.all_gather(z1_list, z1)
+            dist.all_gather(z2_list, z2)
+            # 把所有卡的特征拼起来，第一块放自己的，确保对角线仍是正确配对
+            z1_list[dist.get_rank()] = z1
+            z2_list[dist.get_rank()] = z2
+            z1 = torch.cat(z1_list, dim=0)
+            z2 = torch.cat(z2_list, dim=0)
+
+        B = z1.size(0) # 现在的 B 是全局 Batch Size (如 256)
         z = torch.cat([z1, z2], dim=0)  # [2B, D]
         
         # 计算余弦相似度矩阵并除以温度

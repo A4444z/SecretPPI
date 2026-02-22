@@ -313,7 +313,13 @@ class GlueVAE(nn.Module):
 
             # --- 💥 View 1: 在 A 侧 (受体) 炸出一个 10 埃的大洞，保留 B 侧 ---
             if len(interface_A) > 0:
-                center_idx_A = interface_A[torch.randint(0, len(interface_A), (1,))]
+                # 🚨 加入确定性分支：训练时随机炸，验证时固定炸第一个中心，保证评估公平！
+                if self.training:
+                    idx_A = torch.randint(0, len(interface_A), (1,))
+                else:
+                    idx_A = torch.tensor([0], device=pos.device)
+                
+                center_idx_A = interface_A[idx_A]
                 dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
                 local_mask_A = (dist_to_center_A < 10.0) & (is_ligand[graph_mask] == 0)
                 global_mask_A = torch.where(graph_mask)[0][local_mask_A]
@@ -321,7 +327,13 @@ class GlueVAE(nn.Module):
 
             # --- 💥 View 2: 在 B 侧 (配体) 炸出一个 10 埃的大洞，保留 A 侧 ---
             if len(interface_B) > 0:
-                center_idx_B = interface_B[torch.randint(0, len(interface_B), (1,))]
+                # 🚨 加入确定性分支：训练时随机炸，验证时固定炸第一个中心
+                if self.training:
+                    idx_B = torch.randint(0, len(interface_B), (1,))
+                else:
+                    idx_B = torch.tensor([0], device=pos.device)
+
+                center_idx_B = interface_B[idx_B]
                 dist_to_center_B = torch.norm(pos[graph_mask] - pos[center_idx_B], p=2, dim=-1)
                 local_mask_B = (dist_to_center_B < 10.0) & (is_ligand[graph_mask] == 1)
                 global_mask_B = torch.where(graph_mask)[0][local_mask_B]
@@ -329,9 +341,9 @@ class GlueVAE(nn.Module):
 
         # 实施物理坐标塌陷 (给被破坏的原子赋予随机高斯噪声)
         if mask_v1.sum() > 0:
-            pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * 0.1
+            pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * 0.5
         if mask_v2.sum() > 0:
-            pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * 0.1
+            pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * 0.5
         
         
 
@@ -355,23 +367,22 @@ class GlueVAE(nn.Module):
         atom_feat_v1, z_proj_v1 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v1, pos_v1)
         atom_feat_v2, z_proj_v2 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v2, pos_v2)
 
-        # ================= 🚨 终极核武器：界面专属交叉池化 (Lock & Key Pooling) =================
-        # View 1 (Mask A): 受体被炸毁。Z1 只提取【完好的配体界面原子】(钥匙)
-        mask_ligand_interface = (is_ligand == 1) & (mask_interface == 1)
-        z1_interface = z_proj_v1[mask_ligand_interface]
-        batch_z1 = batch_idx[mask_ligand_interface]
-        graph_z1 = scatter_mean(z1_interface, batch_z1, dim=0, dim_size=num_graphs)
+        # ================= 🚨 升华版：全补丁交叉池化 (杜绝 Oracle 泄露) =================
+        # 以前：mask_ligand_interface = (is_ligand == 1) & (mask_interface == 1)
+        # 现在：模型必须自己从整个 Patch 中提取特征，不知道哪里是真实的 4Å 接触面！
+        
+        # View 1 (Mask A): 受体被炸毁。Z1 提取【整个配体 Patch】(钥匙)
+        mask_ligand = (is_ligand == 1)
+        z1_patch = z_proj_v1[mask_ligand]
+        batch_z1 = batch_idx[mask_ligand]
+        graph_z1 = scatter_mean(z1_patch, batch_z1, dim=0, dim_size=num_graphs)
 
-        # View 2 (Mask B): 配体被炸毁。Z2 只提取【完好的受体界面原子】(锁孔)
-        mask_receptor_interface = (is_ligand == 0) & (mask_interface == 1)
-        z2_interface = z_proj_v2[mask_receptor_interface]
-        batch_z2 = batch_idx[mask_receptor_interface]
-        graph_z2 = scatter_mean(z2_interface, batch_z2, dim=0, dim_size=num_graphs)
-
-        # 再次 L2 归一化 (防除零)
-        graph_z1 = F.normalize(graph_z1, p=2, dim=-1, eps=1e-8)
-        graph_z2 = F.normalize(graph_z2, p=2, dim=-1, eps=1e-8)
-
+        # View 2 (Mask B): 配体被炸毁。Z2 提取【整个受体 Patch】(锁孔)
+        mask_receptor = (is_ligand == 0)
+        z2_patch = z_proj_v2[mask_receptor]
+        batch_z2 = batch_idx[mask_receptor]
+        graph_z2 = scatter_mean(z2_patch, batch_z2, dim=0, dim_size=num_graphs)
+        # ========================================================================
         # ================= 4. 解码重构 (Decoder) =================
         pos_pred_v1 = self.decode(
             atom_feat_v1, z, fake_vector_features,
