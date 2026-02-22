@@ -181,11 +181,17 @@ def validate(
     rank,
     wandb_logger=None
 ):
-    """验证模型。"""
+    """验证模型，并计算 Top-1 检索准确率。"""
     model.eval()
     total_loss = 0.0
     total_recon_loss = 0.0
-    total_contrast_loss = 0.0  # 👈 替换了 kl_loss
+    total_contrast_loss = 0.0
+    
+    # 新增：用于统计相似度和准确率
+    all_top1_acc = []
+    all_pos_sim = []
+    all_neg_sim = []
+    
     num_batches = 0
     
     if rank == 0:
@@ -196,8 +202,8 @@ def validate(
     for batch in pbar:
         batch = batch.to(device)
         
-        # ================= 🚨 新的前向传播接口 (与 train_epoch 一致) =================
-        z1, z2, pos_pred_v1, mask_v1 = model(
+        # 前向传播
+        graph_z1, graph_z2, pos_pred_v1, mask_v1 = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -209,37 +215,71 @@ def validate(
             batch_idx=batch.batch
         )
         
-        # ================= 🚨 新的损失计算接口 =================
+        # 计算基础 Loss
         loss, contrast_loss, recon_loss = criterion(
-            z1=z1,
-            z2=z2,
+            z1=graph_z1,
+            z2=graph_z2,
             pos_pred_v1=pos_pred_v1,
             pos_true=batch.pos,
             mask_v1=mask_v1,
             batch_idx=batch.batch
         )
         
+        # ================= 🚨 新增：潜在相似度与检索测试逻辑 =================
+        # 1. 计算余弦相似度矩阵 [B, B]
+        # 因为 graph_z 已做 L2 归一化，点积即余弦相似度
+        sim_matrix = torch.matmul(graph_z1, graph_z2.T) 
+        
+        # 2. 计算 Top-1 检索准确率 (这一行预测的是不是它自己)
+        preds = sim_matrix.argmax(dim=-1)
+        targets = torch.arange(sim_matrix.size(0), device=device)
+        top1_acc = (preds == targets).float().mean()
+        
+        # 3. 统计正负样本相似度
+        pos_sim = torch.diagonal(sim_matrix).mean() # 对角线：正样本
+        
+        # 负样本：排除对角线后的平均值
+        mask_neg = ~torch.eye(sim_matrix.size(0), dtype=torch.bool, device=device)
+        neg_sim = sim_matrix[mask_neg].mean()
+        
+        # 汇总
+        all_top1_acc.append(top1_acc.item())
+        all_pos_sim.append(pos_sim.item())
+        all_neg_sim.append(neg_sim.item())
+        # ===================================================================
+        
         total_loss += loss.item()
         total_recon_loss += recon_loss.item()
         total_contrast_loss += contrast_loss.item()
         num_batches += 1
     
+    # 计算全验证集的平均指标
     avg_loss = total_loss / num_batches
     avg_recon = total_recon_loss / num_batches
     avg_contrast = total_contrast_loss / num_batches
+    avg_top1 = sum(all_top1_acc) / len(all_top1_acc)
+    avg_pos_sim = sum(all_pos_sim) / len(all_pos_sim)
+    avg_neg_sim = sum(all_neg_sim) / len(all_neg_sim)
     
-    if rank == 0 and wandb_logger is not None:
-        wandb_logger.log({
-            'val/loss': avg_loss,
-            'val/recon_loss': avg_recon,
-            'val/contrast_loss': avg_contrast,  # 👈 记录 contrast
-            'epoch': epoch
-        })
+    if rank == 0:
+        print(f"\n[VAL REPORT] Top-1 Acc: {avg_top1:.4f} | Pos Sim: {avg_pos_sim:.4f} | Neg Sim: {avg_neg_sim:.4f}")
+        
+        if wandb_logger is not None:
+            wandb_logger.log({
+                'val/loss': avg_loss,
+                'val/recon_loss': avg_recon,
+                'val/contrast_loss': avg_contrast,
+                'val/retrieval_top1': avg_top1,    # 👈 检索准确率
+                'val/sim_positive': avg_pos_sim,  # 👈 正样本相似度
+                'val/sim_negative': avg_neg_sim,  # 👈 负样本相似度
+                'epoch': epoch
+            })
     
     return {
         'loss': avg_loss,
         'recon_loss': avg_recon,
-        'contrast_loss': avg_contrast
+        'contrast_loss': avg_contrast,
+        'top1_acc': avg_top1
     }
 
 
@@ -270,18 +310,18 @@ def save_checkpoint(
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # 构造带有时间戳和 epoch 的文件名
-    filename = f"checkpoint_{timestamp}_epoch_{epoch}.pt"
+    filename = f"checkpoint_{timestamp}_epoch_{epoch}_cmae.pt"
     save_path = os.path.join(save_dir, filename)
     
     # 保存带有时间戳的实体文件
     torch.save(checkpoint, save_path)
     
     # 顺手保存一个 `checkpoint_latest.pt`
-    latest_path = os.path.join(save_dir, 'checkpoint_latest.pt')
+    latest_path = os.path.join(save_dir, 'checkpoint_latest_cmae.pt')
     torch.save(checkpoint, latest_path)
     
     if is_best:
-        best_path = os.path.join(save_dir, f'checkpoint_best.pt')
+        best_path = os.path.join(save_dir, f'checkpoint_best_cmae.pt')
         torch.save(checkpoint, best_path)
 
 

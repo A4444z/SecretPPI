@@ -152,8 +152,7 @@ class ConditionalPaiNNDecoder(nn.Module):
         vector_features,
         edge_index,
         edge_attr,
-        pos,
-        residue_index
+        pos
     ):
         """
         参数:
@@ -215,15 +214,13 @@ class GlueVAE(nn.Module):
             use_gradient_checkpointing=use_gradient_checkpointing
         )
         
-        # 原子 -&gt; 残基 Pooling
-        self.residue_pooling = ResiduePooling(reduce='mean')
+        
         
         # ================= 🚨 新增：对比学习投影头 =================
         self.projector = Projector(hidden_dim=hidden_dim, proj_dim=128)
         # =========================================================
         
-        # 残基 -&gt; 原子 Unpooling
-        self.residue_unpooling = ResidueToAtomUnpooling()
+        
         
         # 解码器
         self.decoder = ConditionalPaiNNDecoder(
@@ -251,50 +248,33 @@ class GlueVAE(nn.Module):
         vector_features,
         edge_index,
         edge_attr,
-        pos,
-        residue_index
+        pos
     ):
-        """
-        编码过程：提取残基特征，并投影到对比学习空间。
-        """
-        # 1. PaiNN 编码器提取原子特征
+        """全原子编码，直接将原子特征投射到对比空间。"""
+        # 1. PaiNN 提取全原子特征
         s, v = self.encoder(z, vector_features, edge_index, edge_attr, pos)
 
-        # 2. 原子 -> 残基 Pooling
-        res_features = self.residue_pooling(s, residue_index)
+        # 2. 🚨 直接用全原子特征进行投影，彻底抛弃残基降维！
+        z_proj = self.projector(s) # [N_atoms, proj_dim]
 
-        # 3. 投影到对比空间得到 Z 
-        z_proj = self.projector(res_features)
+        return s, z_proj
 
-        # 返回：完整的残基特征(给Decoder重建用) 和 投影后的Z(给InfoNCE算Loss用)
-        return res_features, z_proj
-
-        
     def decode(
         self,
-        res_features,         # 👈 修改：直接接收完整的残基特征，不再需要 z_latent
+        atom_features,        # 👈 直接接收全原子特征
         z_atom,
         fake_vector_features, 
         edge_index,
         fake_edge_attr,       
-        fake_pos,             
-        residue_index
+        fake_pos
     ):
-        """
-        解码过程：残基特征 -> 还原坐标。
-        """
-        # Unpooling：残基特征 -> 原子特征
-        atom_latent = self.residue_unpooling(res_features, residue_index)
-        
-        # 通过解码器 (此时 Decoder 只能看到残缺的 fake_pos 和 fake 特征)
+        """全原子解码。"""
+        # 直接通过解码器预测坐标偏移
         delta_pos = self.decoder(
-            atom_latent, z_atom, fake_vector_features,
-            edge_index, fake_edge_attr, fake_pos, residue_index
+            atom_features, z_atom, fake_vector_features,
+            edge_index, fake_edge_attr, fake_pos
         )
-        
-        # 必须是在 fake_pos 的基础上进行偏移！
         pos_pred = fake_pos + delta_pos
-        
         return pos_pred
 
     def forward(
@@ -312,12 +292,6 @@ class GlueVAE(nn.Module):
         if batch_idx is None or mask_interface is None:
             raise ValueError("CMAE requires batch_idx and mask_interface.")
 
-        # ================= 🚨 核心修复：全局安全的残基索引压缩 =================
-        # 1. 赋予每个 Graph 极大的偏移量 (100000)，彻底隔离不同复合物的残基 ID
-        global_residue_index = residue_index + batch_idx * 100000
-        # 2. 对这个全局安全的 ID 进行压缩映射，保证绝对不会发生跨 Graph 融合！
-        _, residue_index_compact = torch.unique(global_residue_index, sorted=True, return_inverse=True)
-        # ======================================================================
 
         num_graphs = int(batch_idx.max().item()) + 1
 
@@ -329,37 +303,37 @@ class GlueVAE(nn.Module):
         mask_v1 = torch.zeros(pos.size(0), dtype=torch.bool, device=pos.device)
         mask_v2 = torch.zeros(pos.size(0), dtype=torch.bool, device=pos.device)
 
-        if self.training:
-            for i in range(num_graphs):
-                graph_mask = (batch_idx == i)
+        # 🚨 终极修复：移除了 if self.training:，保证验证时也必须经历相同的严苛破坏！
+        for i in range(num_graphs):
+            graph_mask = (batch_idx == i)
 
-                # 提取 A 侧 (受体, 0) 和 B 侧 (配体, 1) 的界面原子
-                interface_A = torch.where(graph_mask & (is_ligand == 0) & (mask_interface == 1))[0]
-                interface_B = torch.where(graph_mask & (is_ligand == 1) & (mask_interface == 1))[0]
+            # 提取 A 侧 (受体, 0) 和 B 侧 (配体, 1) 的界面原子
+            interface_A = torch.where(graph_mask & (is_ligand == 0) & (mask_interface == 1))[0]
+            interface_B = torch.where(graph_mask & (is_ligand == 1) & (mask_interface == 1))[0]
 
-                # --- 💥 View 1: 在 A 侧 (受体) 炸出一个 10 埃的大洞，保留 B 侧 ---
-                if len(interface_A) > 0:
-                    center_idx_A = interface_A[torch.randint(0, len(interface_A), (1,))]
-                    dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
-                    # 找出局部 10 埃内的 A 侧原子 (必须同属受体)
-                    local_mask_A = (dist_to_center_A < 10.0) & (is_ligand[graph_mask] == 0)
-                    global_mask_A = torch.where(graph_mask)[0][local_mask_A]
-                    mask_v1[global_mask_A] = True
+            # --- 💥 View 1: 在 A 侧 (受体) 炸出一个 10 埃的大洞，保留 B 侧 ---
+            if len(interface_A) > 0:
+                center_idx_A = interface_A[torch.randint(0, len(interface_A), (1,))]
+                dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
+                local_mask_A = (dist_to_center_A < 10.0) & (is_ligand[graph_mask] == 0)
+                global_mask_A = torch.where(graph_mask)[0][local_mask_A]
+                mask_v1[global_mask_A] = True
 
-                # --- 💥 View 2: 在 B 侧 (配体) 炸出一个 10 埃的大洞，保留 A 侧 ---
-                if len(interface_B) > 0:
-                    center_idx_B = interface_B[torch.randint(0, len(interface_B), (1,))]
-                    dist_to_center_B = torch.norm(pos[graph_mask] - pos[center_idx_B], p=2, dim=-1)
-                    # 找出局部 10 埃内的 B 侧原子 (必须同属配体)
-                    local_mask_B = (dist_to_center_B < 10.0) & (is_ligand[graph_mask] == 1)
-                    global_mask_B = torch.where(graph_mask)[0][local_mask_B]
-                    mask_v2[global_mask_B] = True
+            # --- 💥 View 2: 在 B 侧 (配体) 炸出一个 10 埃的大洞，保留 A 侧 ---
+            if len(interface_B) > 0:
+                center_idx_B = interface_B[torch.randint(0, len(interface_B), (1,))]
+                dist_to_center_B = torch.norm(pos[graph_mask] - pos[center_idx_B], p=2, dim=-1)
+                local_mask_B = (dist_to_center_B < 10.0) & (is_ligand[graph_mask] == 1)
+                global_mask_B = torch.where(graph_mask)[0][local_mask_B]
+                mask_v2[global_mask_B] = True
 
-            # 实施物理坐标塌陷 (给被破坏的原子赋予随机高斯噪声，彻底剥夺其局部空间信息)
-            if mask_v1.sum() > 0:
-                pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * 0.1
-            if mask_v2.sum() > 0:
-                pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * 0.1
+        # 实施物理坐标塌陷 (给被破坏的原子赋予随机高斯噪声)
+        if mask_v1.sum() > 0:
+            pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * 0.1
+        if mask_v2.sum() > 0:
+            pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * 0.1
+        
+        
 
         # ================= 2. 重新计算假坐标的边特征 (距离 RBF) =================
         edge_type = edge_attr[:, :3]
@@ -376,35 +350,32 @@ class GlueVAE(nn.Module):
         fake_dist_v2 = torch.sqrt((fake_diff_v2 ** 2).sum(dim=-1) + 1e-8)
         fake_edge_attr_v2 = torch.cat([edge_type, self.rbf(fake_dist_v2)], dim=-1)
 
-        # ================= 3. 双路编码 (Encoder) =================
-        # 🚨 必须把压缩后的 residue_index_compact 传进去！
-        res_feat_v1, z_proj_v1 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v1, pos_v1, residue_index_compact)
-        res_feat_v2, z_proj_v2 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v2, pos_v2, residue_index_compact)
+        # ================= 3. 全原子双路编码 (Encoder) =================
+        # 注意：不再传入 residue_index
+        atom_feat_v1, z_proj_v1 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v1, pos_v1)
+        atom_feat_v2, z_proj_v2 = self.encode(z, fake_vector_features, edge_index, fake_edge_attr_v2, pos_v2)
 
-        # 🚨 核心修复：更安全地构造 res_batch 
-        R = int(residue_index_compact.max().item()) + 1
-        res_batch = torch.zeros(R, dtype=torch.long, device=pos.device)
-        # 因为同残基所有原子的 batch_idx 完全一致，直接 scatter_ 覆盖赋值
-        res_batch.scatter_(0, residue_index_compact, batch_idx)
+        # ================= 🚨 终极核武器：界面专属交叉池化 (Lock & Key Pooling) =================
+        # View 1 (Mask A): 受体被炸毁。Z1 只提取【完好的配体界面原子】(钥匙)
+        mask_ligand_interface = (is_ligand == 1) & (mask_interface == 1)
+        z1_interface = z_proj_v1[mask_ligand_interface]
+        batch_z1 = batch_idx[mask_ligand_interface]
+        graph_z1 = scatter_mean(z1_interface, batch_z1, dim=0, dim_size=num_graphs)
 
-        if self.training:
-            # 工业级保险：检查同一 residue 是否出现多个 batch_id
-            assert torch.all(res_batch[residue_index_compact] == batch_idx), "Residue spans multiple graphs!"
+        # View 2 (Mask B): 配体被炸毁。Z2 只提取【完好的受体界面原子】(锁孔)
+        mask_receptor_interface = (is_ligand == 0) & (mask_interface == 1)
+        z2_interface = z_proj_v2[mask_receptor_interface]
+        batch_z2 = batch_idx[mask_receptor_interface]
+        graph_z2 = scatter_mean(z2_interface, batch_z2, dim=0, dim_size=num_graphs)
 
-        # 2. 将同一个 Graph 下的所有残基向量做平均
-        graph_z1 = scatter_mean(z_proj_v1, res_batch, dim=0)
-        graph_z2 = scatter_mean(z_proj_v2, res_batch, dim=0)
-
-        # 3. 再次 L2 归一化
-        graph_z1 = F.normalize(graph_z1, p=2, dim=-1)
-        graph_z2 = F.normalize(graph_z2, p=2, dim=-1)
+        # 再次 L2 归一化 (防除零)
+        graph_z1 = F.normalize(graph_z1, p=2, dim=-1, eps=1e-8)
+        graph_z2 = F.normalize(graph_z2, p=2, dim=-1, eps=1e-8)
 
         # ================= 4. 解码重构 (Decoder) =================
-        # 为了节约算力且达到辅助重构的目的，我们只挑 View 1 进行解码重构。
-        # Decoder 必须通过隐空间，把被炸掉的受体坐标猜出来。
         pos_pred_v1 = self.decode(
-            res_feat_v1, z, fake_vector_features,
-            edge_index, fake_edge_attr_v1, pos_v1, residue_index_compact
+            atom_feat_v1, z, fake_vector_features,
+            edge_index, fake_edge_attr_v1, pos_v1
         )
 
         return graph_z1, graph_z2, pos_pred_v1, mask_v1
