@@ -213,7 +213,7 @@ def validate(
         batch = batch.to(device)
         
         # 前向传播
-        graph_z1, graph_z2, pos_pred_v1, mask_v1, _ = model(
+        graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -236,6 +236,27 @@ def validate(
         )
         
         # ================= 🚨 新增：潜在相似度与检索测试逻辑 =================
+        ent_weight = config['training'].get('entropy_weight', 0.01)
+        val_total_loss = loss - ent_weight * batch_entropy
+        
+        # ================= 🚨 修复 2：验证集全局检索 (All-Gather) =================
+        if dist.is_initialized():
+            z1_list = [torch.zeros_like(graph_z1) for _ in range(dist.get_world_size())]
+            z2_list = [torch.zeros_like(graph_z2) for _ in range(dist.get_world_size())]
+            dist.all_gather(z1_list, graph_z1)
+            dist.all_gather(z2_list, graph_z2)
+            
+            # 把当前 rank 的放在最前面，确保对角线 targets 依然成立
+            rank_idx = dist.get_rank()
+            z1_list[rank_idx] = graph_z1
+            z2_list[rank_idx] = graph_z2
+            
+            graph_z1_global = torch.cat(z1_list, dim=0)
+            graph_z2_global = torch.cat(z2_list, dim=0)
+        else:
+            graph_z1_global = graph_z1
+            graph_z2_global = graph_z2
+
         # 1. 计算余弦相似度矩阵 [B, B]
         # 因为 graph_z 已做 L2 归一化，点积即余弦相似度
         sim_matrix = torch.matmul(graph_z1, graph_z2.T) 
@@ -258,7 +279,8 @@ def validate(
         all_neg_sim.append(neg_sim.item())
         # ===================================================================
         
-        total_loss += loss.item()
+        # 🚨 修复 1 的收尾：累加的 loss 改为 val_total_loss
+        total_loss += val_total_loss.item() 
         total_recon_loss += recon_loss.item()
         total_contrast_loss += contrast_loss.item()
         num_batches += 1

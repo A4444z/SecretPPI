@@ -153,9 +153,10 @@ class MultiHeadAttentionPooling(nn.Module):
         for h in range(self.num_heads):
             weights[:, h] = softmax(logits[:, h], batch, dim=0)
             
-        # 3. 计算注意力熵 (用于正则化)
+        # 3. 🚨 修复：计算注意力熵并按 Graph 数量归一化
         eps = 1e-8
-        entropy = -torch.sum(weights * torch.log(weights + eps), dim=0) # [num_heads]
+        # 先求所有原子的熵总和，然后除以 Graph 数量，得到“平均每个复合物的熵”
+        entropy = -torch.sum(weights * torch.log(weights + eps), dim=0) / num_graphs # [num_heads]
         mean_entropy = entropy.mean() # 标量
         
         # 4. 多头加权聚合
@@ -362,37 +363,35 @@ class GlueVAE(nn.Module):
         mask_v1 = torch.zeros(pos.size(0), dtype=torch.bool, device=pos.device)
         mask_v2 = torch.zeros(pos.size(0), dtype=torch.bool, device=pos.device)
 
-        # 🚨 终极修复：移除了 if self.training:，保证验证时也必须经历相同的严苛破坏！
+        # 🚨 终极修复：彻底去除对 mask_interface 的依赖，实现真正的自监督掩蔽！
         for i in range(num_graphs):
             graph_mask = (batch_idx == i)
 
-            # 提取 A 侧 (受体, 0) 和 B 侧 (配体, 1) 的界面原子
-            interface_A = torch.where(graph_mask & (is_ligand == 0) & (mask_interface == 1))[0]
-            interface_B = torch.where(graph_mask & (is_ligand == 1) & (mask_interface == 1))[0]
+            # 🚨 修改：提取 A 侧和 B 侧的【所有】原子，不再限定 mask_interface == 1
+            atoms_A = torch.where(graph_mask & (is_ligand == 0))[0]
+            atoms_B = torch.where(graph_mask & (is_ligand == 1))[0]
 
-            # --- 💥 View 1: 在 A 侧 (受体) 炸出一个 10 埃的大洞，保留 B 侧 ---
-            if len(interface_A) > 0:
-                # 🚨 加入确定性分支：训练时随机炸，验证时固定炸第一个中心，保证评估公平！
+            # --- 💥 View 1: 在 A 侧 (受体) 随机炸出一个大洞，保留 B 侧 ---
+            if len(atoms_A) > 0:
                 if self.training:
-                    idx_A = torch.randint(0, len(interface_A), (1,))
+                    idx_A = torch.randint(0, len(atoms_A), (1,))
                 else:
-                    idx_A = torch.tensor([0], device=pos.device)
+                    idx_A = torch.tensor([0], device=pos.device) # 确定性
                 
-                center_idx_A = interface_A[idx_A]
+                center_idx_A = atoms_A[idx_A]
                 dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
                 local_mask_A = (dist_to_center_A < 10.0) & (is_ligand[graph_mask] == 0)
                 global_mask_A = torch.where(graph_mask)[0][local_mask_A]
                 mask_v1[global_mask_A] = True
 
-            # --- 💥 View 2: 在 B 侧 (配体) 炸出一个 10 埃的大洞，保留 A 侧 ---
-            if len(interface_B) > 0:
-                # 🚨 加入确定性分支：训练时随机炸，验证时固定炸第一个中心
+            # --- 💥 View 2: 在 B 侧 (配体) 随机炸出一个大洞，保留 A 侧 ---
+            if len(atoms_B) > 0:
                 if self.training:
-                    idx_B = torch.randint(0, len(interface_B), (1,))
+                    idx_B = torch.randint(0, len(atoms_B), (1,))
                 else:
                     idx_B = torch.tensor([0], device=pos.device)
 
-                center_idx_B = interface_B[idx_B]
+                center_idx_B = atoms_B[idx_B]
                 dist_to_center_B = torch.norm(pos[graph_mask] - pos[center_idx_B], p=2, dim=-1)
                 local_mask_B = (dist_to_center_B < 10.0) & (is_ligand[graph_mask] == 1)
                 global_mask_B = torch.where(graph_mask)[0][local_mask_B]
