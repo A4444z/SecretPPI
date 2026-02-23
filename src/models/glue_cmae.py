@@ -19,6 +19,8 @@ from torch_scatter import scatter_mean, scatter_sum
 from src.models.layers_solo import PaiNNEncoder
 from src.utils.loss_solo import CoordinateDecoder
 
+from torch_geometric.utils import softmax
+
 # ================= 🚨 新增 RBF 类 =================
 class GaussianSmearing(nn.Module):
     """
@@ -114,6 +116,57 @@ class Projector(nn.Module):
         z = F.normalize(z, p=2, dim=-1)
         return z
 
+class MultiHeadAttentionPooling(nn.Module):
+    """
+    工业级多头注意力池化层 (带 LayerNorm 和 熵正则化)。
+    保持输出维度与输入相同，通过分组特征实现多头。
+    """
+    def __init__(self, hidden_dim=128, num_heads=4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim 必须能被 num_heads 整除")
+        
+        self.head_dim = hidden_dim // num_heads
+        
+        # 1. 预处理稳定层：防止原子特征极值导致 Softmax 崩塌
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+        # 2. 多头打分器：一次性输出 num_heads 个分数
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, num_heads) # [N, num_heads]
+        )
+
+    def forward(self, x, batch):
+        N = x.size(0)
+        
+        # 1. 归一化与打分
+        x_norm = self.norm(x)
+        logits = self.attn_mlp(x_norm) # [N, num_heads]
+        
+        # 2. 计算每个 Graph 内部的权重
+        weights = torch.zeros_like(logits)
+        for h in range(self.num_heads):
+            weights[:, h] = softmax(logits[:, h], batch, dim=0)
+            
+        # 3. 计算注意力熵 (用于正则化)
+        eps = 1e-8
+        entropy = -torch.sum(weights * torch.log(weights + eps), dim=0) # [num_heads]
+        mean_entropy = entropy.mean() # 标量
+        
+        # 4. 多头加权聚合
+        x_split = x.view(N, self.num_heads, self.head_dim)
+        weights_expanded = weights.unsqueeze(-1)
+        x_weighted = x_split * weights_expanded
+        
+        x_weighted_flat = x_weighted.view(N, self.hidden_dim)
+        graph_z = scatter_sum(x_weighted_flat, batch, dim=0) # [B, hidden_dim]
+        
+        return graph_z, weights, mean_entropy
 
 class ConditionalPaiNNDecoder(nn.Module):
     """
@@ -199,11 +252,13 @@ class GlueVAE(nn.Module):
         num_decoder_layers=4,
         edge_dim=19,
         vocab_size=101,
-        use_gradient_checkpointing=False
+        use_gradient_checkpointing=False,
+        mask_noise=0.5
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.mask_noise = mask_noise
         
         # 编码器
         self.encoder = PaiNNEncoder(
@@ -218,6 +273,10 @@ class GlueVAE(nn.Module):
         
         # ================= 🚨 新增：对比学习投影头 =================
         self.projector = Projector(hidden_dim=hidden_dim, proj_dim=128)
+
+        # 👇 新增：多头注意力池化层
+        self.attn_pooling = MultiHeadAttentionPooling(hidden_dim=128, num_heads=4)
+        
         # =========================================================
         
         
@@ -341,9 +400,9 @@ class GlueVAE(nn.Module):
 
         # 实施物理坐标塌陷 (给被破坏的原子赋予随机高斯噪声)
         if mask_v1.sum() > 0:
-            pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * 0.5
+            pos_v1[mask_v1] = torch.randn((mask_v1.sum(), 3), device=pos.device) * self.mask_noise
         if mask_v2.sum() > 0:
-            pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * 0.5
+            pos_v2[mask_v2] = torch.randn((mask_v2.sum(), 3), device=pos.device) * self.mask_noise
         
         
 
@@ -371,22 +430,31 @@ class GlueVAE(nn.Module):
         # 以前：mask_ligand_interface = (is_ligand == 1) & (mask_interface == 1)
         # 现在：模型必须自己从整个 Patch 中提取特征，不知道哪里是真实的 4Å 接触面！
         
-        # View 1 (Mask A): 受体被炸毁。Z1 提取【整个配体 Patch】(钥匙)
+        # ================= 🚨 修复 2：注意力交叉池化 (Attention Pooling) =================
         mask_ligand = (is_ligand == 1)
         z1_patch = z_proj_v1[mask_ligand]
         batch_z1 = batch_idx[mask_ligand]
-        graph_z1 = scatter_mean(z1_patch, batch_z1, dim=0, dim_size=num_graphs)
+        # 用注意力代替 scatter_mean
+        graph_z1, attn_w1, entropy_1 = self.attn_pooling(z1_patch, batch_z1)
 
-        # View 2 (Mask B): 配体被炸毁。Z2 提取【整个受体 Patch】(锁孔)
         mask_receptor = (is_ligand == 0)
         z2_patch = z_proj_v2[mask_receptor]
         batch_z2 = batch_idx[mask_receptor]
-        graph_z2 = scatter_mean(z2_patch, batch_z2, dim=0, dim_size=num_graphs)
+        # 用注意力代替 scatter_mean
+        graph_z2, attn_w2, entropy_2 = self.attn_pooling(z2_patch, batch_z2)
+
+        # 再次 L2 归一化
+        graph_z1 = F.normalize(graph_z1, p=2, dim=-1, eps=1e-8)
+        graph_z2 = F.normalize(graph_z2, p=2, dim=-1, eps=1e-8)
+        
+        # 汇总熵
+        batch_entropy = (entropy_1 + entropy_2) / 2.0
         # ========================================================================
-        # ================= 4. 解码重构 (Decoder) =================
+        
         pos_pred_v1 = self.decode(
             atom_feat_v1, z, fake_vector_features,
             edge_index, fake_edge_attr_v1, pos_v1
         )
 
-        return graph_z1, graph_z2, pos_pred_v1, mask_v1
+        # 👇 结尾必须多返回一个 batch_entropy
+        return graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy

@@ -99,7 +99,7 @@ def train_epoch(
             print("="*40 + "\n")
         
         # ================= 🚨 新的前向传播接口 =================
-        z1, z2, pos_pred_v1, mask_v1 = model(
+        z1, z2, pos_pred_v1, mask_v1, batch_entropy = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -127,6 +127,13 @@ def train_epoch(
             mask_v1=mask_v1,
             batch_idx=batch.batch
         )
+
+        # 🚨 核心逻辑：加入熵正则化惩罚 (减去熵，即鼓励注意力分散)
+        # 这里的 0.01 是控制熵正则化强度的超参数
+        # 使用一个新的变量名 step_loss，千万不要覆盖外层的 total_loss
+
+        ent_weight = config['training'].get('entropy_weight', 0.01)
+        step_loss = loss - ent_weight * batch_entropy
         
         if rank == 0 and epoch == 0 and batch_idx == 0:
             print("\n[DEBUG] loss finite check")
@@ -135,34 +142,37 @@ def train_epoch(
             print("  recon_loss finite:", torch.isfinite(recon_loss).item())
         
         optimizer.zero_grad()
-        loss.backward()
+        step_loss.backward()  # 👈 对 step_loss 反向传播
         
         max_grad_norm = config['training']['max_grad_norm']
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         
         optimizer.step()
         
-        total_loss += loss.item()
+        # 累加器保持 float 相加
+        total_loss += step_loss.item() 
         total_recon_loss += recon_loss.item()
         total_contrast_loss += contrast_loss.item()
         num_batches += 1
         
         if rank == 0:
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
+                'loss': f'{step_loss.item():.4f}',
                 'recon': f'{recon_loss.item():.4f}',
-                'contrast': f'{contrast_loss.item():.4f}'  # 👈 显示 contrast
+                'contrast': f'{contrast_loss.item():.4f}'
             })
         
         if (batch_idx + 1) % log_interval == 0 and rank == 0 and wandb_logger is not None:
             wandb_logger.log({
-                'train/loss': loss.item(),
+                'train/loss': step_loss.item(),
                 'train/recon_loss': recon_loss.item(),
-                'train/contrast_loss': contrast_loss.item(),  # 👈 记录 contrast
+                'train/contrast_loss': contrast_loss.item(),
+                'train/entropy': batch_entropy.item(),  # 👈 新增：在 WandB 监控注意力熵！
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'batch': batch_idx
             })
+        # =========================================================
     
     return {
         'loss': total_loss / num_batches,
@@ -203,7 +213,7 @@ def validate(
         batch = batch.to(device)
         
         # 前向传播
-        graph_z1, graph_z2, pos_pred_v1, mask_v1 = model(
+        graph_z1, graph_z2, pos_pred_v1, mask_v1, _ = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -488,7 +498,8 @@ def main():
         num_decoder_layers=config['model']['num_decoder_layers'],
         edge_dim=config['model']['edge_dim'],
         vocab_size=config['model']['vocab_size'],
-        use_gradient_checkpointing=config['model']['use_gradient_checkpointing']
+        use_gradient_checkpointing=config['model']['use_gradient_checkpointing'],
+        mask_noise=config['model'].get('mask_noise',0.5)
     ).to(device)
     
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)

@@ -21,6 +21,7 @@ model:
   edge_dim: 19
   vocab_size: 101
   use_gradient_checkpointing: true
+  mask_noise: 0.5
 
 # 训练配置
 training:
@@ -35,6 +36,7 @@ training:
   lambda_recon: 1.0        # 局部重构损失权重 (辅助物理保真)
   recon_cutoff: 15.0
   # =====================================================
+  entropy_weight: 0.01
   
   # 优化器配置
   optimizer:
