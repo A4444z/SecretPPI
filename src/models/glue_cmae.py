@@ -449,6 +449,24 @@ class GlueVAE(nn.Module):
         # 汇总熵
         batch_entropy = (entropy_1 + entropy_2) / 2.0
         # ========================================================================
+
+        # ================= 🚨 新增：注意力引导损失 (Attention Guidance) =================
+        # 提取当前 Batch 的真实界面标签
+        label_ligand = mask_interface[mask_ligand].float()
+        label_receptor = mask_interface[mask_receptor].float()
+        
+        # 将多头注意力权重 [N, num_heads] 平均成单头综合注意力概率 [N]
+        prob_ligand = attn_w1.mean(dim=-1)
+        prob_receptor = attn_w2.mean(dim=-1)
+        
+        # 计算辅助引导损失：鼓励 attention 权重在 mask_interface == 1 的地方变大
+        # 相当于计算交叉熵的正样本项，除以真实界面原子数以稳定量级
+        eps = 1e-8
+        guidance_loss_ligand = -torch.sum(label_ligand * torch.log(prob_ligand + eps)) / (label_ligand.sum() + eps)
+        guidance_loss_receptor = -torch.sum(label_receptor * torch.log(prob_receptor + eps)) / (label_receptor.sum() + eps)
+        
+        attn_guidance_loss = (guidance_loss_ligand + guidance_loss_receptor) / 2.0
+        # ========================================================================
         
         pos_pred_v1 = self.decode(
             atom_feat_v1, z, fake_vector_features,
@@ -456,4 +474,4 @@ class GlueVAE(nn.Module):
         )
 
         # 👇 结尾必须多返回一个 batch_entropy
-        return graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy
+        return graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy, attn_guidance_loss

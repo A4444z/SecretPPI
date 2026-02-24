@@ -99,7 +99,7 @@ def train_epoch(
             print("="*40 + "\n")
         
         # ================= 🚨 新的前向传播接口 =================
-        z1, z2, pos_pred_v1, mask_v1, batch_entropy = model(
+        z1, z2, pos_pred_v1, mask_v1, batch_entropy, attn_guidance_loss = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -133,7 +133,13 @@ def train_epoch(
         # 使用一个新的变量名 step_loss，千万不要覆盖外层的 total_loss
 
         ent_weight = config['training'].get('entropy_weight', 0.01)
-        step_loss = loss - ent_weight * batch_entropy
+
+        # 读取引导权重，如果没有设置则默认给个 1.0 (让老师严厉一点)
+        guidance_weight = config['training'].get('guidance_weight', 1.0)
+
+        # 新的总 Loss = 原始 Loss - 熵正则 + 注意力引导惩罚
+        step_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
+        # ==========================================================
         
         if rank == 0 and epoch == 0 and batch_idx == 0:
             print("\n[DEBUG] loss finite check")
@@ -186,6 +192,7 @@ def train_epoch(
                 'train/contrast_loss': contrast_loss.item(),
                 'train/entropy': batch_entropy.item(),  # 👈 新增：在 WandB 监控注意力熵！
                 'train/temperature': current_temp,  # 👈 新增：监控当前温度！
+                'train/guidance_loss': attn_guidance_loss.item(),
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'batch': batch_idx
