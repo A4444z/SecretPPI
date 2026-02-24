@@ -8,6 +8,27 @@ import torch.nn as nn
 from torch_geometric.utils import to_dense_batch
 import torch.nn.functional as F
 import torch.distributed as dist
+import math
+
+class GatherLayer(torch.autograd.Function):
+    """
+    带梯度回传的全局 Gather 层 (工业级标准实现)。
+    不仅收集特征，还能在反向传播时将来自所有 GPU 的梯度精准归还。
+    """
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # 把各自分块的梯度堆叠起来
+        all_gradients = torch.stack(grads)
+        # 将全网所有显卡算出的梯度进行求和 (All-Reduce)
+        dist.all_reduce(all_gradients)
+        # 精准抽取出属于当前显卡的那一份梯度并返回！
+        return all_gradients[dist.get_rank()]
 
 # ================= 1. 核心重构损失：Masked D-RMSD =================
 
@@ -78,22 +99,17 @@ class InfoNCELoss(nn.Module):
         super().__init__()
         # 🚨 替换固定的 temperature，改为可学习的 logit_scale
         # 初始化为 ln(1/temperature)
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / temperature))
 
     def forward(self, z1, z2):
         # 跨 GPU 全局负样本收集 (All-Gather)
+        # 🚨 终极修复：使用可导的 GatherLayer，跨 GPU 汇聚 100% 的梯度！
         if dist.is_initialized():
-            z1_list = [torch.zeros_like(z1) for _ in range(dist.get_world_size())]
-            z2_list = [torch.zeros_like(z2) for _ in range(dist.get_world_size())]
-            dist.all_gather(z1_list, z1)
-            dist.all_gather(z2_list, z2)
+            z1_gathered = GatherLayer.apply(z1)
+            z2_gathered = GatherLayer.apply(z2)
             
-            # 保留本地计算图的梯度
-            z1_list[dist.get_rank()] = z1
-            z2_list[dist.get_rank()] = z2
-            
-            z1 = torch.cat(z1_list, dim=0)
-            z2 = torch.cat(z2_list, dim=0)
+            z1 = torch.cat(z1_gathered, dim=0)
+            z2 = torch.cat(z2_gathered, dim=0)
 
         B = z1.size(0) 
         z = torch.cat([z1, z2], dim=0)  # [2B, D]

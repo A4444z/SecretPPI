@@ -71,7 +71,7 @@ def train_epoch(
     config,
     rank,
     wandb_logger=None
-):
+    ):
     """训练一个 epoch。"""
     model.train()
     total_loss = 0.0
@@ -144,16 +144,19 @@ def train_epoch(
         optimizer.zero_grad()
         step_loss.backward()  # 👈 对 step_loss 反向传播
         
-        # ================= 🚨 添加梯度探针 =================
+        # ================= 🚨 新增：高精度梯度探针 =================
         if rank == 0 and batch_idx % 50 == 0:
-            # 看看投影头和注意力层到底有没有吃到梯度！
             proj_grad = model.module.projector.mlp[0].weight.grad
             attn_grad = model.module.attn_pooling.attn_mlp[0].weight.grad
+            scale_grad = criterion.logit_scale.grad
             
-            proj_norm = proj_grad.norm().item() if proj_grad is not None else 0.0
-            attn_norm = attn_grad.norm().item() if attn_grad is not None else 0.0
-            print(f"\n[GRAD CHECK] Projector Grad: {proj_norm:.4f}, Attention Grad: {attn_norm:.4f}")
-        # ====================================================
+            # 显式判断 None，并使用科学计数法 (.3e) 打印极其微小的梯度
+            proj_str = "None" if proj_grad is None else f"{proj_grad.norm().item():.3e}"
+            attn_str = "None" if attn_grad is None else f"{attn_grad.norm().item():.3e}"
+            scale_str = "None" if scale_grad is None else f"{scale_grad.item():.3e}"
+            
+            print(f"\n[GRAD CHECK] Proj: {proj_str} | Attn: {attn_str} | Temp Scale: {scale_str}")
+        # =========================================================================
 
         max_grad_norm = config['training']['max_grad_norm']
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -174,6 +177,9 @@ def train_epoch(
             })
         
         if (batch_idx + 1) % log_interval == 0 and rank == 0 and wandb_logger is not None:
+
+            current_temp = 1.0 / criterion.logit_scale.exp().item()
+
             wandb_logger.log({
                 'train/loss': step_loss.item(),
                 'train/recon_loss': recon_loss.item(),
@@ -562,7 +568,7 @@ def main():
         lambda_contrast=l_contrast,
         lambda_recon=l_recon,
         cutoff=recon_cutoff  # 建议使用截断以限制损失仅在局部
-    )
+    ).to(device)
     # =========================================================
     
     optimizer_config = config['training']['optimizer']
