@@ -144,6 +144,17 @@ def train_epoch(
         optimizer.zero_grad()
         step_loss.backward()  # 👈 对 step_loss 反向传播
         
+        # ================= 🚨 添加梯度探针 =================
+        if rank == 0 and batch_idx % 50 == 0:
+            # 看看投影头和注意力层到底有没有吃到梯度！
+            proj_grad = model.module.projector.mlp[0].weight.grad
+            attn_grad = model.module.attn_pooling.attn_mlp[0].weight.grad
+            
+            proj_norm = proj_grad.norm().item() if proj_grad is not None else 0.0
+            attn_norm = attn_grad.norm().item() if attn_grad is not None else 0.0
+            print(f"\n[GRAD CHECK] Projector Grad: {proj_norm:.4f}, Attention Grad: {attn_norm:.4f}")
+        # ====================================================
+
         max_grad_norm = config['training']['max_grad_norm']
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         
@@ -168,6 +179,7 @@ def train_epoch(
                 'train/recon_loss': recon_loss.item(),
                 'train/contrast_loss': contrast_loss.item(),
                 'train/entropy': batch_entropy.item(),  # 👈 新增：在 WandB 监控注意力熵！
+                'train/temperature': current_temp,  # 👈 新增：监控当前温度！
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'batch': batch_idx
@@ -259,11 +271,11 @@ def validate(
 
         # 1. 计算余弦相似度矩阵 [B, B]
         # 因为 graph_z 已做 L2 归一化，点积即余弦相似度
-        sim_matrix = torch.matmul(graph_z1, graph_z2.T) 
+        sim_matrix = torch.matmul(graph_z1_global, graph_z2_global.T) 
         
         # 2. 计算 Top-1 检索准确率 (这一行预测的是不是它自己)
         preds = sim_matrix.argmax(dim=-1)
-        targets = torch.arange(sim_matrix.size(0), device=device)
+        targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
         top1_acc = (preds == targets).float().mean()
         
         # 3. 统计正负样本相似度
@@ -315,9 +327,15 @@ def validate(
     }
 
 
+import os
+import torch
+import datetime
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 def save_checkpoint(
     model,
     optimizer,
+    criterion,
     epoch,
     step,
     save_dir,
@@ -335,25 +353,27 @@ def save_checkpoint(
         'epoch': epoch,
         'step': step,
         'model_state_dict': model_state_dict,
+        'criterion_state_dict': criterion.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
     
-    # 获取当前时间，格式例如：20260220_153045
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 🚨 获取当前进程号 (PID)
+    pid = os.getpid()
     
-    # 构造带有时间戳和 epoch 的文件名
-    filename = f"checkpoint_{timestamp}_epoch_{epoch}_cmae.pt"
+    # 🚨 构造带有 进程号 和 epoch 的文件名
+    # 格式为：checkpoint_进程号_epoch_n.pt
+    filename = f"checkpoint_{pid}_epoch_{epoch}.pt"
     save_path = os.path.join(save_dir, filename)
     
-    # 保存带有时间戳的实体文件
+    # 保存实体文件
     torch.save(checkpoint, save_path)
     
-    # 顺手保存一个 `checkpoint_latest.pt`
-    latest_path = os.path.join(save_dir, 'checkpoint_latest_cmae.pt')
+    # 顺手保存一个 `checkpoint_latest.pt` (加上进程号以免多开任务时互相覆盖)
+    latest_path = os.path.join(save_dir, f'checkpoint_{pid}_latest.pt')
     torch.save(checkpoint, latest_path)
     
     if is_best:
-        best_path = os.path.join(save_dir, f'checkpoint_best_cmae.pt')
+        best_path = os.path.join(save_dir, f'checkpoint_{pid}_best.pt')
         torch.save(checkpoint, best_path)
 
 
@@ -548,7 +568,10 @@ def main():
     optimizer_config = config['training']['optimizer']
     if optimizer_config['type'] == 'Adam':
         optimizer = optim.Adam(
-            model.parameters(),
+        [
+        {'params': model.parameters()},  # 第一组：模型的参数
+        {'params': criterion.parameters()} # 第二组：损失函数的参数
+        ],
             lr=config['training']['learning_rate'],
             weight_decay=config['training']['weight_decay'],
             betas=tuple(optimizer_config['betas']),
@@ -584,6 +607,10 @@ def main():
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
             
+        # 🚨 新增：安全加载 criterion 的状态（为了兼容旧版没有保存该字段的 checkpoint）
+        if 'criterion_state_dict' in checkpoint:
+            criterion.load_state_dict(checkpoint['criterion_state_dict'])
+
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         global_step = checkpoint['step']
@@ -634,12 +661,12 @@ def main():
                     print(f"New best val loss: {best_val_loss:.4f}")
                 
                 global_step = (epoch + 1) * len(train_loader)
-                save_checkpoint(model, optimizer, epoch, global_step, save_dir, is_best)
+                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best)
         else:
             save_interval_epochs = config['logging'].get('save_interval', 10)
             if rank == 0 and (epoch + 1) % save_interval_epochs == 0:
                 global_step = (epoch + 1) * len(train_loader)
-                save_checkpoint(model, optimizer, epoch, global_step, save_dir, is_best=False)
+                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best=False)
     
     if rank == 0:
         print("Training complete!")

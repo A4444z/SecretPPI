@@ -76,40 +76,44 @@ class MaskedDRMSDLoss(nn.Module):
 class InfoNCELoss(nn.Module):
     def __init__(self, temperature=0.1):
         super().__init__()
-        self.temperature = temperature
+        # 🚨 替换固定的 temperature，改为可学习的 logit_scale
+        # 初始化为 ln(1/temperature)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
 
     def forward(self, z1, z2):
-        # 🚨 新增：跨 GPU 全局负样本收集 (All-Gather)
+        # 跨 GPU 全局负样本收集 (All-Gather)
         if dist.is_initialized():
             z1_list = [torch.zeros_like(z1) for _ in range(dist.get_world_size())]
             z2_list = [torch.zeros_like(z2) for _ in range(dist.get_world_size())]
             dist.all_gather(z1_list, z1)
             dist.all_gather(z2_list, z2)
-            # 把所有卡的特征拼起来，第一块放自己的，确保对角线仍是正确配对
+            
+            # 保留本地计算图的梯度
             z1_list[dist.get_rank()] = z1
             z2_list[dist.get_rank()] = z2
+            
             z1 = torch.cat(z1_list, dim=0)
             z2 = torch.cat(z2_list, dim=0)
 
-        B = z1.size(0) # 现在的 B 是全局 Batch Size (如 256)
+        B = z1.size(0) 
         z = torch.cat([z1, z2], dim=0)  # [2B, D]
         
-        # 计算余弦相似度矩阵并除以温度
-        logits = torch.matmul(z, z.T) / self.temperature
+        # 🚨 限制最大 scale 为 100 (对应最低温度 0.01)，防止早期梯度爆炸
+        logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
         
-        # 🚨 屏蔽对角线 (自己和自己的相似度设为极小值)
+        # 🚨 计算余弦相似度并乘以可学习的 scale (代替除以温度)
+        logits = torch.matmul(z, z.T) * logit_scale
+        
+        # 屏蔽对角线 (自己和自己的相似度设为极小值)
         mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
         logits = logits.masked_fill(mask, -1e9)
         
-        # 构建分类 Target：
-        # z1[i] 的正样本是 z2[i] (即索引 i + B)
-        # z2[i] 的正样本是 z1[i] (即索引 i)
+        # 构建分类 Target
         targets = torch.cat([
             torch.arange(B, 2 * B, device=z.device),
             torch.arange(0, B, device=z.device)
         ], dim=0)
         
-        # 直接使用交叉熵，极其稳定
         return F.cross_entropy(logits, targets)
 
 # ================= 3. 组合引擎：CMAE Loss =================
@@ -133,6 +137,11 @@ class CMAELoss(nn.Module):
         self.info_nce_loss = InfoNCELoss(temperature=temperature)
         self.drmsd_loss = MaskedDRMSDLoss(reduction='mean', cutoff=cutoff)
         
+    # 🚨 新增：方便外部 (train_cmae.py) 直接读取当前温度进行 WandB 记录
+    @property
+    def logit_scale(self):
+        return self.info_nce_loss.logit_scale
+        
     def forward(
         self,
         z1,
@@ -152,6 +161,3 @@ class CMAELoss(nn.Module):
         total_loss = self.lambda_contrast * contrast_loss + self.lambda_recon * recon_loss
         
         return total_loss, contrast_loss, recon_loss
-
-# ================= 附录：清理冗余 =================
-# 旧的 KLLoss, BetaScheduler, VAELoss, CoordinateDecoder 已被彻底删除。

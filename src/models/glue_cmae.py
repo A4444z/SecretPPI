@@ -141,7 +141,7 @@ class MultiHeadAttentionPooling(nn.Module):
             nn.Linear(hidden_dim // 2, num_heads) # [N, num_heads]
         )
 
-    def forward(self, x, batch):
+    def forward(self, x, batch, num_graphs):
         N = x.size(0)
         
         # 1. 归一化与打分
@@ -151,7 +151,7 @@ class MultiHeadAttentionPooling(nn.Module):
         # 2. 计算每个 Graph 内部的权重
         weights = torch.zeros_like(logits)
         for h in range(self.num_heads):
-            weights[:, h] = softmax(logits[:, h], batch, dim=0)
+            weights[:, h] = softmax(logits[:, h], batch, num_nodes=num_graphs, dim=0)
             
         # 3. 🚨 修复：计算注意力熵并按 Graph 数量归一化
         eps = 1e-8
@@ -165,7 +165,7 @@ class MultiHeadAttentionPooling(nn.Module):
         x_weighted = x_split * weights_expanded
         
         x_weighted_flat = x_weighted.view(N, self.hidden_dim)
-        graph_z = scatter_sum(x_weighted_flat, batch, dim=0) # [B, hidden_dim]
+        graph_z = scatter_sum(x_weighted_flat, batch, dim=0, dim_size=num_graphs) # [B, hidden_dim]
         
         return graph_z, weights, mean_entropy
 
@@ -434,13 +434,13 @@ class GlueVAE(nn.Module):
         z1_patch = z_proj_v1[mask_ligand]
         batch_z1 = batch_idx[mask_ligand]
         # 用注意力代替 scatter_mean
-        graph_z1, attn_w1, entropy_1 = self.attn_pooling(z1_patch, batch_z1)
+        graph_z1, attn_w1, entropy_1 = self.attn_pooling(z1_patch, batch_z1, num_graphs)
 
         mask_receptor = (is_ligand == 0)
         z2_patch = z_proj_v2[mask_receptor]
         batch_z2 = batch_idx[mask_receptor]
         # 用注意力代替 scatter_mean
-        graph_z2, attn_w2, entropy_2 = self.attn_pooling(z2_patch, batch_z2)
+        graph_z2, attn_w2, entropy_2 = self.attn_pooling(z2_patch, batch_z2, num_graphs)
 
         # 再次 L2 归一化
         graph_z1 = F.normalize(graph_z1, p=2, dim=-1, eps=1e-8)

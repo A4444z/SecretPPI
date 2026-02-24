@@ -31,12 +31,12 @@ training:
   max_grad_norm: 5.0
   
   # ================= 🚨 CMAE 专属超参数 =================
-  temperature: 0.05      # InfoNCE 温度系数 (建议范围: 0.07 ~ 0.2)
+  temperature: 0.2      # InfoNCE 温度系数 (建议范围: 0.07 ~ 0.2)
   lambda_contrast: 1.0     # 对比损失权重 (主导流形拉伸)
   lambda_recon: 1.0        # 局部重构损失权重 (辅助物理保真)
   recon_cutoff: 15.0
   # =====================================================
-  entropy_weight: 0.01
+  entropy_weight: 0.001
   
   # 优化器配置
   optimizer:
@@ -74,6 +74,6 @@ augmentation:
     random_translation: false
     translation_std: 0.1
   val:
-    random_rotation: ture
-    random_translation: ture
+    random_rotation: false
+    random_translation: false
 
