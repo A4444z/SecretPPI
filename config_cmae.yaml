@@ -37,6 +37,8 @@ training:
   recon_cutoff: 15.0
   # =====================================================
   entropy_weight: 0.001
+  use_attention_guidance: true
+  guidance_weight: 1.0
   
   # 优化器配置
   optimizer:

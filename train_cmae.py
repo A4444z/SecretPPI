@@ -135,7 +135,8 @@ def train_epoch(
         ent_weight = config['training'].get('entropy_weight', 0.01)
 
         # 读取引导权重，如果没有设置则默认给个 1.0 (让老师严厉一点)
-        guidance_weight = config['training'].get('guidance_weight', 1.0)
+        use_attention_guidance = config['training'].get('use_attention_guidance', True)
+        guidance_weight = config['training'].get('guidance_weight', 1.0) if use_attention_guidance else 0.0
 
         # 新的总 Loss = 原始 Loss - 熵正则 + 注意力引导惩罚
         step_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
@@ -193,6 +194,7 @@ def train_epoch(
                 'train/entropy': batch_entropy.item(),  # 👈 新增：在 WandB 监控注意力熵！
                 'train/temperature': current_temp,  # 👈 新增：监控当前温度！
                 'train/guidance_loss': attn_guidance_loss.item(),
+                'train/use_attention_guidance': float(use_attention_guidance),
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
                 'epoch': epoch,
                 'batch': batch_idx
@@ -262,7 +264,8 @@ def validate(
         
         # ================= 🚨 新增：潜在相似度与检索测试逻辑 =================
         ent_weight = config['training'].get('entropy_weight', 0.01)
-        guidance_weight = config['training'].get('guidance_weight', 1.0)
+        use_attention_guidance = config['training'].get('use_attention_guidance', True)
+        guidance_weight = config['training'].get('guidance_weight', 1.0) if use_attention_guidance else 0.0
         val_total_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
         
         # ================= 🚨 修复 2：验证集全局检索 (All-Gather) =================
@@ -330,6 +333,7 @@ def validate(
                 'val/retrieval_top1': avg_top1,    # 👈 检索准确率
                 'val/sim_positive': avg_pos_sim,  # 👈 正样本相似度
                 'val/sim_negative': avg_neg_sim,  # 👈 负样本相似度
+                'val/use_attention_guidance': float(use_attention_guidance),
                 'epoch': epoch
             })
     
