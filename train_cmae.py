@@ -238,7 +238,7 @@ def validate(
         batch = batch.to(device)
         
         # 前向传播
-        graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy = model(
+        graph_z1, graph_z2, pos_pred_v1, mask_v1, batch_entropy, attn_guidance_loss  = model(
             z=batch.x,
             vector_features=batch.vector_features,
             edge_index=batch.edge_index,
@@ -262,7 +262,8 @@ def validate(
         
         # ================= 🚨 新增：潜在相似度与检索测试逻辑 =================
         ent_weight = config['training'].get('entropy_weight', 0.01)
-        val_total_loss = loss - ent_weight * batch_entropy
+        guidance_weight = config['training'].get('guidance_weight', 1.0)
+        val_total_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
         
         # ================= 🚨 修复 2：验证集全局检索 (All-Gather) =================
         if dist.is_initialized():

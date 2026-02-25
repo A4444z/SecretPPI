@@ -376,7 +376,9 @@ class GlueVAE(nn.Module):
                 if self.training:
                     idx_A = torch.randint(0, len(atoms_A), (1,))
                 else:
-                    idx_A = torch.tensor([0], device=pos.device) # 确定性
+                    pos_A = pos[atoms_A]
+                    center_A = pos_A.mean(dim=0, keepdim=True)
+                    idx_A = torch.argmin(torch.norm(pos_A - center_A, dim=-1)).view(1) # 确定性
                 
                 center_idx_A = atoms_A[idx_A]
                 dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
@@ -389,7 +391,9 @@ class GlueVAE(nn.Module):
                 if self.training:
                     idx_B = torch.randint(0, len(atoms_B), (1,))
                 else:
-                    idx_B = torch.tensor([0], device=pos.device)
+                    pos_B = pos[atoms_B]
+                    center_B = pos_B.mean(dim=0, keepdim=True)
+                    idx_B = torch.argmin(torch.norm(pos_B - center_B, dim=-1)).view(1)
 
                 center_idx_B = atoms_B[idx_B]
                 dist_to_center_B = torch.norm(pos[graph_mask] - pos[center_idx_B], p=2, dim=-1)
