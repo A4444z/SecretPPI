@@ -355,6 +355,17 @@ class GlueVAE(nn.Module):
 
         num_graphs = int(batch_idx.max().item()) + 1
 
+        # 🚨 核心手术：物理斩断跨链边 (Sever Cross-chain Edges)
+        # 强迫模型分别学习孤立的靶点表面和配体表面，消除 OOD (分布偏移) 坍缩
+        # ========================================================================
+        row, col = edge_index
+        # 只有边的两端属于同一条链（都是 0，或都是 1），same_chain_mask 才为 True
+        same_chain_mask = (is_ligand[row] == is_ligand[col])
+        
+        # 覆盖原始的图拓扑
+        edge_index = edge_index[:, same_chain_mask]
+        edge_attr = edge_attr[same_chain_mask, :]
+
         # ================= 1. 构造 View 1 (Mask A) 和 View 2 (Mask B) =================
         # 克隆坐标，防止污染原始真实坐标
         pos_v1 = pos.clone() 
