@@ -12,7 +12,7 @@
 module load soft/anaconda3/config
 source activate
 conda activate /home/fit/liulei/WORK/miniconda3/envs/secret
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY environment variable is not set}"
 export PYTHONUNBUFFERED=1
 
 # ===================== 项目配置 =====================
@@ -31,7 +31,7 @@ echo "========================================"
 
 # ===================== 启动 DDP 训练 =====================
 echo "开始 GlueVAE 8卡 DDP 训练"
-echo "配置文件: config_solo.yaml"
+echo "配置文件: config_cmae.yaml"
 echo "========================================"
 
 # 使用 torchrun 启动 (推荐方式)

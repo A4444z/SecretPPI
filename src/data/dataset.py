@@ -5,10 +5,11 @@ import lmdb
 import torch
 import numpy as np
 import json
+import hashlib
 from torch_geometric.data import Dataset, Data
 from torch_cluster import radius_graph, knn_graph
 from torch_scatter import scatter_add
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from src.utils.geometry import GaussianRBF, get_random_rotation_matrix, apply_rotation
 
@@ -27,11 +28,11 @@ class GlueVAEDataset(Dataset):
     """
     
     def __init__(
-        self, 
-        root: str, 
-        split: str = 'train', 
-        transform=None, 
-        pre_transform=None, 
+        self,
+        root: str,
+        split: str = 'train',
+        transform=None,
+        pre_transform=None,
         lmdb_path: Optional[str] = None,
         max_atoms: int = 1000,
         patch_radius: float = 15.0,
@@ -40,12 +41,13 @@ class GlueVAEDataset(Dataset):
         exclude_pdb_json: Optional[str] = None,
         random_rotation: bool = True,
         max_samples: Optional[int] = None,
-        cutoff_radius: float = 8.0
+        cutoff_radius: float = 8.0,
+        split_ratio: Optional[Dict[str, float]] = None
     ):
         """
         参数:
             root: 数据集根目录。
-            split: 'train', 'val', 或 'test'。用于决定是否进行数据增强。
+            split: 'train', 'val', 或 'test'。决定数据增强和数据分区。
             lmdb_path: LMDB 数据库路径。如果为 None，则默认使用 root/processed_lmdb。
             max_atoms: 触发补丁采样的最大原子数，默认1000。
             patch_radius: 补丁采样的半径阈值，单位Å，默认15.0。
@@ -53,6 +55,7 @@ class GlueVAEDataset(Dataset):
             num_fps_points: 使用最远点采样(FPS)生成的候选中心数量，默认5。
             exclude_pdb_json: 包含需要排除的PDB ID的JSON文件路径（如CASF-2016）。
             max_samples: 最多加载多少个样本，None 表示全部加载。
+            split_ratio: 各split的比例，如 {'train': 0.9, 'val': 0.05, 'test': 0.05}。
         """
         self.lmdb_path = lmdb_path or os.path.join(root, "processed_lmdb")
         self.split = split
@@ -63,7 +66,10 @@ class GlueVAEDataset(Dataset):
         self.max_samples = max_samples
         self._keys: Optional[List[bytes]] = None
         self._env: Optional[lmdb.Environment] = None
-        
+
+        # Deterministic train/val/test split ratios
+        self.split_ratio = split_ratio or {'train': 0.9, 'val': 0.05, 'test': 0.05}
+
         # 加载需要排除的PDB ID
         self.exclude_pdb_ids = set()
         if exclude_pdb_json is not None and os.path.exists(exclude_pdb_json):
@@ -72,19 +78,18 @@ class GlueVAEDataset(Dataset):
                 if 'all_pdb_ids' in exclude_data:
                     self.exclude_pdb_ids = set(pdb_id.lower() for pdb_id in exclude_data['all_pdb_ids'])
                     print(f"已加载 {len(self.exclude_pdb_ids)} 个需排除的PDB ID")
-        
-        # 新增：是否随机旋转
-        self.random_rotation = random_rotation
-        
-        # 用于维护每个样本的采样状态
-        self._sample_states = {}
 
-        # 🚨 必须在这里把参数赋值给 self！
+        self.random_rotation = random_rotation
+
+        # 用于维护每个样本的采样状态 (capped to prevent memory leak)
+        self._sample_states = {}
+        self._max_sample_states = 10000
+
         self.cutoff_radius = cutoff_radius
-        
+
         # 几何计算工具：高斯径向基函数 (RBF)
         self.rbf = GaussianRBF(n_rbf=16, cutoff=self.cutoff_radius, start=0.0)
-        
+
         super().__init__(root, transform, pre_transform)
     
     def _process(self):
@@ -105,6 +110,28 @@ class GlueVAEDataset(Dataset):
         state = self.__dict__.copy()
         state['_env'] = None  # 强制子进程自己重新初始化 LMDB 连接
         return state
+
+    @staticmethod
+    def _pdb_id_from_key(key: bytes) -> str:
+        """Extract PDB ID from LMDB key (format: 'pdb_id|chainA-chainB')."""
+        try:
+            return key.decode('utf-8').split('|')[0].lower()
+        except Exception:
+            return key.hex()
+
+    def _assign_split(self, pdb_id: str) -> str:
+        """Deterministic hash-based split assignment by PDB ID.
+        All chain-pairs from the same PDB go to the same split."""
+        h = int(hashlib.md5(pdb_id.encode()).hexdigest(), 16) % 10000
+        h_norm = h / 10000.0
+        train_end = self.split_ratio.get('train', 0.9)
+        val_end = train_end + self.split_ratio.get('val', 0.05)
+        if h_norm < train_end:
+            return 'train'
+        elif h_norm < val_end:
+            return 'val'
+        else:
+            return 'test'
 
     @property
     def raw_file_names(self) -> List[str]:
@@ -139,68 +166,58 @@ class GlueVAEDataset(Dataset):
             )
             self._env_pid = current_pid  # 记住当前环境是谁开的
     
-    def _load_keys(self): 
-        """从数据库中加载 Keys，支持完整缓存与快速调试截断。""" 
-        self._connect_db() 
-         
-        # 缓存文件路径 
-        cache_path = os.path.join(self.lmdb_path, f"keys_cache_{self.split}.pkl") 
-         
-        # ================= 情景 1：全量模式且存在缓存 -> 秒速读取 ================= 
-        if self._keys is None and self.max_samples is None and os.path.exists(cache_path): 
-            print("\n" + "="*60) 
-            print(f"🚀 [CACHE HIT] 发现全量缓存文件，正在秒速加载！") 
-            print(f"📂 路径: {cache_path}") 
-            with open(cache_path, 'rb') as f: 
-                self._keys = pickle.load(f) 
-            print(f"✅ 成功从缓存加载 {len(self._keys)} 个样本！启动起飞！") 
-            print("="*60 + "\n") 
-            return 
- 
-        # ================= 情景 2：无缓存 或 处于限制数量的调试模式 ================= 
-        if self._keys is None: 
-            self._keys = [] 
-            print("\n" + "="*60) 
-            if self.max_samples is not None: 
-                print(f"⚠️ [DEBUG MODE] 当前限制最大读取数量: {self.max_samples}") 
-            else: 
-                print("⏳ [CACHE MISS] 未找到缓存，正在遍历 LMDB 数据库...") 
-                print("   （因为走网络文件系统，这可能需要5 h，请喝100杯咖啡）") 
-             
-            with self._env.begin() as txn: 
-                cursor = txn.cursor() 
-                 
-                for k, _ in cursor: 
-                    # 1. 黑名单过滤 (例如 CASF-2016) 
-                    if self.exclude_pdb_ids: 
-                        try: 
-                            key_str = k.decode('utf-8') 
-                            pdb_id = key_str.split('|')[0].lower() 
-                            if pdb_id in self.exclude_pdb_ids: 
-                                continue # 命中黑名单，直接跳过 
-                        except: 
-                            continue # 格式错误跳过 
-                     
-                    # 2. 通过筛选，加入列表 
-                    self._keys.append(k) 
-                     
-                    # 3. 截断判断：一旦凑够了我们需要的数量，立刻掀桌子走人！ 
-                    if self.max_samples is not None and len(self._keys) >= self.max_samples: 
-                        print(f"🛑 已达到最大样本数限制 ({self.max_samples})，提前终止遍历！") 
-                        break 
-             
-            print(f"✅ 本次实际遍历加载了 {len(self._keys)} 个样本。") 
-             
-            # ================= 情景 3：全量模式下保存缓存 ================= 
-            if self.max_samples is None: 
-                print(f"💾 [SAVING CACHE] 正在将全量目录保存到缓存文件...") 
-                with open(cache_path, 'wb') as f: 
-                    pickle.dump(self._keys, f) 
-                print(f"🎉 缓存保存成功！文件位置: {cache_path}") 
-                print(f"   下一次启动训练将只需 1 秒钟！") 
-            else: 
-                print("🚫 [NO CACHE] 提示：当前为局部调试模式，为了防止缓存被污染，本次【不保存】缓存。") 
-            print("="*60 + "\n")
+    def _load_keys(self):
+        """从数据库中加载 Keys，按 PDB ID 哈希进行 train/val/test 分区。"""
+        self._connect_db()
+
+        # Cache filename includes split ratio to auto-invalidate on ratio change
+        ratio_tag = f"{self.split_ratio.get('train',0.9):.2f}_{self.split_ratio.get('val',0.05):.2f}"
+        cache_path = os.path.join(self.lmdb_path, f"keys_cache_{self.split}_{ratio_tag}.pkl")
+
+        # Fast path: load from cache
+        if self._keys is None and self.max_samples is None and os.path.exists(cache_path):
+            print(f"[CACHE HIT] Loading {self.split} keys from {cache_path}")
+            with open(cache_path, 'rb') as f:
+                self._keys = pickle.load(f)
+            print(f"  Loaded {len(self._keys)} samples for split='{self.split}'")
+            return
+
+        # Slow path: scan LMDB and partition by PDB ID hash
+        if self._keys is None:
+            all_keys = []
+            print(f"[CACHE MISS] Scanning LMDB for split='{self.split}' ...")
+
+            with self._env.begin() as txn:
+                cursor = txn.cursor()
+                for k, _ in cursor:
+                    # Blacklist filtering (e.g. CASF-2016)
+                    if self.exclude_pdb_ids:
+                        try:
+                            pdb_id = k.decode('utf-8').split('|')[0].lower()
+                            if pdb_id in self.exclude_pdb_ids:
+                                continue
+                        except Exception:
+                            continue
+
+                    all_keys.append(k)
+
+            # Deterministic split: assign each key by PDB ID hash
+            self._keys = [k for k in all_keys
+                          if self._assign_split(self._pdb_id_from_key(k)) == self.split]
+
+            print(f"  Total LMDB keys (after blacklist): {len(all_keys)}")
+            print(f"  Keys assigned to '{self.split}': {len(self._keys)}")
+
+            # Truncate if max_samples is set (debug mode)
+            if self.max_samples is not None and len(self._keys) > self.max_samples:
+                self._keys = self._keys[:self.max_samples]
+                print(f"  Truncated to max_samples={self.max_samples}")
+
+            # Save cache (only in full mode)
+            if self.max_samples is None:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(self._keys, f)
+                print(f"  Cache saved to {cache_path}")
     def len(self) -> int:
         """返回数据集样本总数。"""
         self._load_keys()
@@ -284,7 +301,13 @@ class GlueVAEDataset(Dataset):
                 'candidate_centers': cand_list,
                 'current_index': 0
             }
-        
+
+            # Prevent unbounded memory growth
+            if len(self._sample_states) > self._max_sample_states:
+                keys_to_remove = list(self._sample_states.keys())[:len(self._sample_states) // 2]
+                for rm_key in keys_to_remove:
+                    del self._sample_states[rm_key]
+
         state = self._sample_states[key_str]
         return state['candidate_centers'], state['current_index']
     

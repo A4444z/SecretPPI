@@ -32,7 +32,12 @@ def main():
         Z1_global = data['Z1']
         Z2_global = data['Z2']
     else:
-        print("🚀 加载验证集并开始提取特征...")
+        print("Loading validation set and extracting features...")
+        split_ratio = {
+            'train': config['data'].get('train_split', 0.9),
+            'val': config['data'].get('val_split', 0.05),
+            'test': config['data'].get('test_split', 0.05),
+        }
         val_dataset = GlueVAEDataset(
             root=config['data']['root_dir'],
             lmdb_path=config['data']['lmdb_path'],
@@ -40,7 +45,8 @@ def main():
             exclude_pdb_json=config['data'].get('exclude_pdb_json'),
             random_rotation=False,
             max_samples=config['data'].get('max_samples', None),
-            cutoff_radius=config['training'].get('recon_cutoff', 15.0)
+            cutoff_radius=config['training'].get('recon_cutoff', 15.0),
+            split_ratio=split_ratio
         )
         val_loader = PyGDataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
@@ -63,7 +69,7 @@ def main():
         for batch in tqdm(val_loader, desc="Feature Extraction"):
             batch = batch.to(device)
             # 调用 forward，由于 model.eval()，会进入确定性分支
-            graph_z1, graph_z2, _, _ = model(
+            graph_z1, graph_z2, _, _, _, _ = model(
                 z=batch.x, vector_features=batch.vector_features,
                 edge_index=batch.edge_index, edge_attr=batch.edge_attr,
                 pos=batch.pos, residue_index=batch.residue_index,

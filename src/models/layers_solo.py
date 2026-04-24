@@ -344,38 +344,6 @@ class PaiNNEncoder(nn.Module):
         # 计算边向量: r_j - r_i
         row, col = edge_index
         edge_vec = pos[col] - pos[row]  # [E, 3]
-        
-                # ===== [DEBUG] 只打印一次 =====
-        if not hasattr(self, "_debug_once_encoder"):
-            self._debug_once_encoder = False
-
-        # 输入体检
-        if not self._debug_once_encoder:
-            print("\n[DEBUG][PaiNNEncoder] input check")
-            print("  z dtype:", z.dtype, "min/max:", int(z.min()), int(z.max()))
-            print("  pos finite:", torch.isfinite(pos).all().item(), "shape:", tuple(pos.shape))
-            print("  vector_features finite:", torch.isfinite(vector_features).all().item(), "shape:", tuple(vector_features.shape))
-            print("  edge_attr finite:", torch.isfinite(edge_attr).all().item(), "shape:", tuple(edge_attr.shape))
-            print("  edge_index shape:", tuple(edge_index.shape), "min/max:", int(edge_index.min()), int(edge_index.max()))
-            print("  num_nodes:", int(pos.size(0)))
-            if int(edge_index.max()) >= int(pos.size(0)) or int(edge_index.min()) < 0:
-                print("  [ALERT] edge_index 越界！")
-        # ===== [DEBUG] 只打印一次 =====
-        if not hasattr(self, "_debug_once_encoder"):
-            self._debug_once_encoder = False
-
-        # 输入体检
-        if not self._debug_once_encoder:
-            print("\n[DEBUG][PaiNNEncoder] input check")
-            print("  z dtype:", z.dtype, "min/max:", int(z.min()), int(z.max()))
-            print("  pos finite:", torch.isfinite(pos).all().item(), "shape:", tuple(pos.shape))
-            print("  vector_features finite:", torch.isfinite(vector_features).all().item(), "shape:", tuple(vector_features.shape))
-            print("  edge_attr finite:", torch.isfinite(edge_attr).all().item(), "shape:", tuple(edge_attr.shape))
-            print("  edge_index shape:", tuple(edge_index.shape), "min/max:", int(edge_index.min()), int(edge_index.max()))
-            print("  num_nodes:", int(pos.size(0)))
-            if int(edge_index.max()) >= int(pos.size(0)) or int(edge_index.min()) < 0:
-                print("  [ALERT] edge_index 越界！")
-        # ============================
 
         # 通过 PaiNN 块
         for i, block in enumerate(self.blocks):
@@ -387,24 +355,12 @@ class PaiNNEncoder(nn.Module):
             else:
                 s, v = block(s, v, edge_index, edge_attr, edge_vec)
 
-            # 每层检查
+            # Safety check: halt early on NaN/Inf
             if not torch.isfinite(s).all() or not torch.isfinite(v).all():
-                print(f"\n[DEBUG][PaiNNEncoder] NaN/Inf appears at block {i}")
-                print("  s finite:", torch.isfinite(s).all().item())
-                print("  v finite:", torch.isfinite(v).all().item())
-                print("  s range:", float(torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0).min()),
-                    float(torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0).max()))
-                print("  v abs max:", float(torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0).abs().max()))
-                # 直接中断，避免后面污染
                 raise RuntimeError(f"Non-finite detected after PaiNN block {i}")
 
         # 输出投影
         s_out = self.out_s(s)
-
-        if not self._debug_once_encoder:
-            print("\n[DEBUG][PaiNNEncoder] output check")
-            print("  s_out finite:", torch.isfinite(s_out).all().item(), "shape:", tuple(s_out.shape))
-            self._debug_once_encoder = True
 
         return s_out, v
 

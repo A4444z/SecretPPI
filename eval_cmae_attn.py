@@ -16,7 +16,7 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 def main():
-    parser = argparse.ArgumentParser(description='CMAE Test Set Evaluation (Old Model)')
+    parser = argparse.ArgumentParser(description='CMAE Test Set Evaluation (Attention Pooling)')
     parser.add_argument('--config', type=str, default='config_cmae.yaml', help='配置文件路径')
     parser.add_argument('--checkpoint', type=str, required=True, help='训练好的 .pt 权重路径')
     parser.add_argument('--test_lmdb', type=str, required=True, help='测试集 LMDB 路径')
@@ -29,13 +29,19 @@ def main():
 
     config = load_config(args.config)
 
-    # 1. 构建测试数据集 (关闭随机旋转)
-    print("加载测试集...")
+    # 1. Build test dataset (no augmentation)
+    print("Loading test set...")
+    split_ratio = {
+        'train': config['data'].get('train_split', 0.9),
+        'val': config['data'].get('val_split', 0.05),
+        'test': config['data'].get('test_split', 0.05),
+    }
     test_dataset = GlueVAEDataset(
         root=config['data']['root_dir'],
         lmdb_path=args.test_lmdb,
         split='test',
-        random_rotation=False # 评估时必须关闭随机旋转
+        random_rotation=False,
+        split_ratio=split_ratio
     )
     
     test_loader = PyGDataLoader(
@@ -47,7 +53,7 @@ def main():
     )
 
     # 2. 初始化旧版模型并加载权重
-    print("加载旧版 CMAE (scatter_mean) 模型...")
+    print("Loading CMAE (Attention Pooling) model...")
     # 🚨 注意：去掉了 mask_noise，因为旧版 __init__ 不接受这个参数
     model = GlueVAE(
         hidden_dim=config['model']['hidden_dim'],

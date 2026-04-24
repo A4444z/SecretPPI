@@ -298,4 +298,4 @@ class VirtualScreener:
         }
 
 if __name__ == "__main__":
-    main()
+    print("This module provides screening utilities. Use run_screening.py as the entry point.")

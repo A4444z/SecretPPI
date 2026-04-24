@@ -25,6 +25,10 @@ data/processed_lmdb/
 *.mdb
 *.lock
 *.log
+checkpoints/
+*.pt
+screening_results/
+processed_progress.txt
 wandb/
 .venv/
 env/

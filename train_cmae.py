@@ -66,11 +66,12 @@ def train_epoch(
     train_loader,
     optimizer,
     criterion,
-    device,            # 👈 删除了 beta_scheduler
+    device,
     epoch,
     config,
     rank,
-    wandb_logger=None
+    wandb_logger=None,
+    scaler=None
     ):
     """训练一个 epoch。"""
     model.train()
@@ -98,77 +99,62 @@ def train_epoch(
             print(f"  [is_ligand] 是否存在: {hasattr(batch, 'is_ligand')}")
             print("="*40 + "\n")
         
-        # ================= 🚨 新的前向传播接口 =================
-        z1, z2, pos_pred_v1, mask_v1, batch_entropy, attn_guidance_loss = model(
-            z=batch.x,
-            vector_features=batch.vector_features,
-            edge_index=batch.edge_index,
-            edge_attr=batch.edge_attr,
-            pos=batch.pos,
-            residue_index=batch.residue_index,
-            is_ligand=batch.is_ligand,            # 👈 新增：受体配体标签
-            mask_interface=batch.mask_interface,  
-            batch_idx=batch.batch                 
-        )
-        
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            print("\n[DEBUG] forward finite check")
-            print("  z1 finite:", torch.isfinite(z1).all().item())
-            print("  z2 finite:", torch.isfinite(z2).all().item())
-            print("  pos_pred_v1 finite:", torch.isfinite(pos_pred_v1).all().item())
-            print(f"  mask_v1 sum (破坏的原子数): {mask_v1.sum().item()}")
-        
-        # ================= 🚨 新的损失计算接口 =================
-        loss, contrast_loss, recon_loss = criterion(
-            z1=z1,
-            z2=z2,
-            pos_pred_v1=pos_pred_v1,
-            pos_true=batch.pos,
-            mask_v1=mask_v1,
-            batch_idx=batch.batch
-        )
+        # ================= 前向传播与损失计算 (AMP-aware) =================
+        use_amp = scaler is not None
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            z1, z2, pos_pred_v1, mask_v1, batch_entropy, attn_guidance_loss = model(
+                z=batch.x,
+                vector_features=batch.vector_features,
+                edge_index=batch.edge_index,
+                edge_attr=batch.edge_attr,
+                pos=batch.pos,
+                residue_index=batch.residue_index,
+                is_ligand=batch.is_ligand,
+                mask_interface=batch.mask_interface,
+                batch_idx=batch.batch
+            )
 
-        # 🚨 核心逻辑：加入熵正则化惩罚 (减去熵，即鼓励注意力分散)
-        # 这里的 0.01 是控制熵正则化强度的超参数
-        # 使用一个新的变量名 step_loss，千万不要覆盖外层的 total_loss
+            loss, contrast_loss, recon_loss = criterion(
+                z1=z1,
+                z2=z2,
+                pos_pred_v1=pos_pred_v1,
+                pos_true=batch.pos,
+                mask_v1=mask_v1,
+                batch_idx=batch.batch
+            )
 
-        ent_weight = config['training'].get('entropy_weight', 0.01)
+            ent_weight = config['training'].get('entropy_weight', 0.01)
+            use_attention_guidance = config['training'].get('use_attention_guidance', True)
+            guidance_weight = config['training'].get('guidance_weight', 1.0) if use_attention_guidance else 0.0
+            step_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
+        # ==================================================================
 
-        # 读取引导权重，如果没有设置则默认给个 1.0 (让老师严厉一点)
-        use_attention_guidance = config['training'].get('use_attention_guidance', True)
-        guidance_weight = config['training'].get('guidance_weight', 1.0) if use_attention_guidance else 0.0
-
-        # 新的总 Loss = 原始 Loss - 熵正则 + 注意力引导惩罚
-        step_loss = loss - ent_weight * batch_entropy + guidance_weight * attn_guidance_loss
-        # ==========================================================
-        
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            print("\n[DEBUG] loss finite check")
-            print("  loss finite:", torch.isfinite(loss).item())
-            print("  contrast_loss finite:", torch.isfinite(contrast_loss).item())
-            print("  recon_loss finite:", torch.isfinite(recon_loss).item())
-        
         optimizer.zero_grad()
-        step_loss.backward()  # 👈 对 step_loss 反向传播
+        if use_amp:
+            scaler.scale(step_loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            step_loss.backward()
         
-        # ================= 🚨 新增：高精度梯度探针 =================
-        if rank == 0 and batch_idx % 50 == 0:
+        # ================= 梯度探针 (需要在 config 中设置 logging.debug_gradients: true) =================
+        if rank == 0 and batch_idx % 50 == 0 and config.get('logging', {}).get('debug_gradients', False):
             proj_grad = model.module.projector.mlp[0].weight.grad
             attn_grad = model.module.attn_pooling.attn_mlp[0].weight.grad
             scale_grad = criterion.logit_scale.grad
-            
-            # 显式判断 None，并使用科学计数法 (.3e) 打印极其微小的梯度
             proj_str = "None" if proj_grad is None else f"{proj_grad.norm().item():.3e}"
             attn_str = "None" if attn_grad is None else f"{attn_grad.norm().item():.3e}"
             scale_str = "None" if scale_grad is None else f"{scale_grad.item():.3e}"
-            
             print(f"\n[GRAD CHECK] Proj: {proj_str} | Attn: {attn_str} | Temp Scale: {scale_str}")
         # =========================================================================
 
         max_grad_norm = config['training']['max_grad_norm']
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        
-        optimizer.step()
+
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         
         # 累加器保持 float 相加
         total_loss += step_loss.item() 
@@ -357,22 +343,24 @@ def save_checkpoint(
     epoch,
     step,
     save_dir,
-    is_best=False
+    is_best=False,
+    scaler=None
 ):
     """保存模型检查点（仅 rank 0）。"""
     os.makedirs(save_dir, exist_ok=True)
-    
+
     if isinstance(model, DDP):
         model_state_dict = model.module.state_dict()
     else:
         model_state_dict = model.state_dict()
-    
+
     checkpoint = {
         'epoch': epoch,
         'step': step,
         'model_state_dict': model_state_dict,
         'criterion_state_dict': criterion.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
     }
     
     # 🚨 获取当前进程号 (PID)
@@ -433,6 +421,13 @@ def main():
     if rank == 0:
         print("Loading dataset...")
     
+    # Build split_ratio from config
+    split_ratio = {
+        'train': config['data'].get('train_split', 0.9),
+        'val': config['data'].get('val_split', 0.05),
+        'test': config['data'].get('test_split', 0.05),
+    }
+
     if args.overfit_test:
         if rank == 0:
             print("!!! RUNNING IN OVERFIT TEST MODE !!!")
@@ -443,28 +438,30 @@ def main():
             split='train',
             exclude_pdb_json=None,
             random_rotation=use_rotation,
-            max_samples=batch_size
+            max_samples=batch_size,
+            split_ratio=split_ratio
         )
         train_dataset = full_dataset
         val_dataset = full_dataset
         if rank == 0:
             print(f"Overfit test: Using {len(train_dataset)} samples for both train and val")
-            
-    else: 
+
+    else:
         val_aug = aug_config.get('val', {})
         val_use_rotation = val_aug.get('random_rotation', False)
-        
+
         current_max_samples = config['data'].get('max_samples', None)
 
         if rank == 0:
-            print("Rank 0: 开始构建 PyG 元文件与 LMDB 缓存...")
+            print("Rank 0: Building dataset caches ...")
             train_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
                 lmdb_path=config['data']['lmdb_path'],
                 split='train',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
                 random_rotation=use_rotation,
-                max_samples=current_max_samples
+                max_samples=current_max_samples,
+                split_ratio=split_ratio
             )
             val_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
@@ -472,26 +469,28 @@ def main():
                 split='val',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
                 random_rotation=val_use_rotation,
-                max_samples=current_max_samples
+                max_samples=current_max_samples,
+                split_ratio=split_ratio
             )
             total_len = len(train_full_dataset)
             _ = len(val_full_dataset)
-            print("Rank 0: 缓存构建完毕！")
+            print("Rank 0: Cache built.")
 
         dist.barrier(device_ids=[local_rank])
 
         if rank != 0:
             import time
-            print(f"Rank {rank}: 正在等待 NFS 同步 (10秒)...")
-            time.sleep(10) 
-            
+            print(f"Rank {rank}: Waiting for NFS sync (10s)...")
+            time.sleep(10)
+
             train_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
                 lmdb_path=config['data']['lmdb_path'],
                 split='train',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
                 random_rotation=use_rotation,
-                max_samples=current_max_samples
+                max_samples=current_max_samples,
+                split_ratio=split_ratio
             )
             val_full_dataset = GlueVAEDataset(
                 root=config['data']['root_dir'],
@@ -499,17 +498,15 @@ def main():
                 split='val',
                 exclude_pdb_json=config['data'].get('exclude_pdb_json'),
                 random_rotation=val_use_rotation,
-                max_samples=current_max_samples
+                max_samples=current_max_samples,
+                split_ratio=split_ratio
             )
             total_len = len(train_full_dataset)
 
         dist.barrier(device_ids=[local_rank])
 
-        # 👇 -------- 把这几行粘贴进去 -------- 👇
-        # 直接使用我们在上面配置好的专门的 train 和 val 数据集，杜绝索引错位！
         train_dataset = train_full_dataset
         val_dataset = val_full_dataset
-        # 👆 -------- 粘贴结束 -------- 👆
 
         if rank == 0:
             print(f"Total dataset size: {total_len}")
@@ -562,7 +559,7 @@ def main():
         mask_noise=config['model'].get('mask_noise',0.5)
     ).to(device)
     
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     if rank == 0:
         num_params = sum(p.numel() for p in model.parameters())
@@ -610,29 +607,36 @@ def main():
     else:
         scheduler = None
     
+    use_amp = config['training'].get('use_amp', False) and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if rank == 0:
+        print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
+
     start_epoch = 0
     global_step = 0
     best_val_loss = float('inf')
-    
+
     if args.resume is not None:
         if rank == 0:
             print(f"Resuming from checkpoint: {args.resume}")
-        
+
         checkpoint = torch.load(args.resume, map_location=device)
-        
+
         if isinstance(model, DDP):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
-            
-        # 🚨 新增：安全加载 criterion 的状态（为了兼容旧版没有保存该字段的 checkpoint）
+
         if 'criterion_state_dict' in checkpoint:
             criterion.load_state_dict(checkpoint['criterion_state_dict'])
 
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         global_step = checkpoint['step']
-        
+
+        if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
         if rank == 0:
             print(f"✅ Resumed at epoch {start_epoch}, step {global_step}")
     
@@ -644,10 +648,9 @@ def main():
     for epoch in range(start_epoch, config['training']['num_epochs']):
         train_sampler.set_epoch(epoch)
         
-        # 🚨 注意去掉了 beta_scheduler 传参
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion,
-            device, epoch, config, rank, wandb_logger
+            device, epoch, config, rank, wandb_logger, scaler
         )
         
         if rank == 0:
@@ -679,12 +682,12 @@ def main():
                     print(f"New best val loss: {best_val_loss:.4f}")
                 
                 global_step = (epoch + 1) * len(train_loader)
-                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best)
+                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best, scaler)
         else:
             save_interval_epochs = config['logging'].get('save_interval', 10)
             if rank == 0 and (epoch + 1) % save_interval_epochs == 0:
                 global_step = (epoch + 1) * len(train_loader)
-                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best=False)
+                save_checkpoint(model, optimizer, criterion, epoch, global_step, save_dir, is_best=False, scaler=scaler)
     
     if rank == 0:
         print("Training complete!")

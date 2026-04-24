@@ -17,7 +17,6 @@ import torch.nn.functional as F
 from torch_scatter import scatter_mean, scatter_sum
 
 from src.models.layers_solo import PaiNNEncoder
-from src.utils.loss_solo import CoordinateDecoder
 
 from torch_geometric.utils import softmax
 
@@ -385,11 +384,11 @@ class GlueVAE(nn.Module):
             # --- 💥 View 1: 在 A 侧 (受体) 随机炸出一个大洞，保留 B 侧 ---
             if len(atoms_A) > 0:
                 if self.training:
-                    idx_A = torch.randint(0, len(atoms_A), (1,))
+                    idx_A = torch.randint(0, len(atoms_A), (1,), device=pos.device)
                 else:
                     pos_A = pos[atoms_A]
                     center_A = pos_A.mean(dim=0, keepdim=True)
-                    idx_A = torch.argmin(torch.norm(pos_A - center_A, dim=-1)).view(1) # 确定性
+                    idx_A = torch.argmin(torch.norm(pos_A - center_A, dim=-1)).view(1)
                 
                 center_idx_A = atoms_A[idx_A]
                 dist_to_center_A = torch.norm(pos[graph_mask] - pos[center_idx_A], p=2, dim=-1)
@@ -400,7 +399,7 @@ class GlueVAE(nn.Module):
             # --- 💥 View 2: 在 B 侧 (配体) 随机炸出一个大洞，保留 A 侧 ---
             if len(atoms_B) > 0:
                 if self.training:
-                    idx_B = torch.randint(0, len(atoms_B), (1,))
+                    idx_B = torch.randint(0, len(atoms_B), (1,), device=pos.device)
                 else:
                     pos_B = pos[atoms_B]
                     center_B = pos_B.mean(dim=0, keepdim=True)
