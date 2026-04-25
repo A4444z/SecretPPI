@@ -122,7 +122,7 @@ class InfoNCELoss(nn.Module):
         
         # 屏蔽对角线 (自己和自己的相似度设为极小值)
         mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
-        logits = logits.masked_fill(mask, -1e9)
+        logits = logits.masked_fill(mask, float('-inf'))
         
         # 构建分类 Target
         targets = torch.cat([
